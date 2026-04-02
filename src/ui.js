@@ -285,7 +285,7 @@ export function chatPage() {
 
     <!-- Query input area: text field + send button -->
     <div id="input-area">
-      <input type="text" id="query-input" placeholder="Stel een vraag..." autocomplete="off">
+      <textarea id="query-input" placeholder="Stel een vraag..." autocomplete="off" rows="1"></textarea>
       <button id="send-btn">Verstuur</button>
     </div>
   </main>
