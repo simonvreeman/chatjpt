@@ -1,0 +1,20 @@
+#:schema node_modules/wrangler/config-schema.json
+name = "chatjpt"
+main = "src/worker.js"
+compatibility_date = "2025-04-01"
+workers_dev = true
+
+# Route: serve at vreeman.com/chatjpt
+routes = [
+  { pattern = "vreeman.ai/chatjpt*", zone_name = "vreeman.ai" }
+]
+
+# Import .md files as text strings
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+fallthrough = true
+
+# Workers AI binding -- required for embeddings + LLM
+[ai]
+binding = "AI"

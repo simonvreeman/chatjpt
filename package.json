@@ -1,0 +1,16 @@
+{
+  "name": "chatjpt",
+  "version": "0.1.0",
+  "description": "ChatJPT - AI-powered Q&A for Cityguys.nl, running on Cloudflare Workers.",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate-index.mjs",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "wrangler": "^4"
+  },
+  "license": "MIT"
+}
