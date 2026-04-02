@@ -219,11 +219,12 @@ export function chatPage() {
     /* ── Input Area ─────────────────────────────── */
     #input-area {
       display: flex;
+      align-items: flex-end;
       gap: 0.5rem;
       padding: 0.5rem 0;
     }
 
-    /* Text input: pill-shaped with subtle border */
+    /* Text input: pill-shaped with subtle border, auto-expands */
     #query-input {
       flex: 1;
       padding: 0.75rem 1rem;
@@ -234,6 +235,11 @@ export function chatPage() {
       transition: border-color 0.2s;
       background: var(--surface);
       color: var(--text);
+      resize: none;
+      overflow-y: hidden;
+      font-family: inherit;
+      line-height: 1.4;
+      max-height: 150px;
     }
 
     /* Accent border on focus */
@@ -302,7 +308,7 @@ export function chatPage() {
 
     /** @type {HTMLElement} The messages container element */
     const messages = document.getElementById('messages');
-    /** @type {HTMLInputElement} The query text input */
+    /** @type {HTMLTextAreaElement} The query text area */
     const input = document.getElementById('query-input');
     /** @type {HTMLButtonElement} The send button */
     const sendBtn = document.getElementById('send-btn');
@@ -449,6 +455,7 @@ export function chatPage() {
       // Display the user's message and reset the input
       addMessage('user', query);
       input.value = '';
+      input.style.height = 'auto';
       sendBtn.disabled = true;
       showTyping();
 
@@ -568,9 +575,18 @@ export function chatPage() {
       if (q) ask(q);
     });
 
-    // Send on Enter key press
+    // Auto-resize textarea as content changes
+    function autoResize() {
+      input.style.height = 'auto';
+      input.style.height = input.scrollHeight + 'px';
+      input.style.overflowY = input.scrollHeight > 150 ? 'auto' : 'hidden';
+    }
+    input.addEventListener('input', autoResize);
+
+    // Send on Enter, newline on Shift+Enter
     input.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
         const q = input.value.trim();
         if (q) ask(q);
       }
