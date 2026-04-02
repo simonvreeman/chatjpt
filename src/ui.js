@@ -55,6 +55,21 @@ export function chatPage() {
       --accent-light: #fed7aa;    /* Light accent (unused, reserved for highlights) */
     }
 
+    /* ── Dark Mode (auto-detected from OS preference) ── */
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #010017;
+        --surface: #0a0a2a;
+        --surface2: #12123a;
+        --border: #1e1e4a;
+        --text: #e5e5e5;
+        --text-muted: #a3a3a3;
+        --accent: #FF2D78;
+        --accent-hover: #FF4D8E;
+        --accent-light: #5c2d3a;
+      }
+    }
+
     /* Reset: normalize spacing and use border-box for predictable sizing */
     * { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -217,6 +232,8 @@ export function chatPage() {
       font-size: 0.95rem;
       outline: none;
       transition: border-color 0.2s;
+      background: var(--surface);
+      color: var(--text);
     }
 
     /* Accent border on focus */
