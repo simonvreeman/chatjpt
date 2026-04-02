@@ -279,7 +279,7 @@ export function chatPage() {
     <div id="messages">
       <!-- Initial greeting message from the assistant -->
       <div class="message assistant">
-        Dit is ChatJPT, de AI die alles weet wat Cityguys ooit heeft opgeschreven. Burgers, bars, citytrips, noem het maar. Vraag maar raak.
+        Dit is ChatJPT — de AI die alles weet wat Cityguys ooit heeft opgeschreven. 🍔 Burgers, 🍺 bars, 🏙️ citytrips, noem het maar. Vraag maar raak.
       </div>
     </div>
 
