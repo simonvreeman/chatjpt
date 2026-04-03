@@ -261,6 +261,22 @@ export function chatPage() {
     #send-btn:hover { background: var(--accent-hover); }
     #send-btn:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
 
+    /* Reset button: subtle circular button to start a new conversation */
+    #reset-btn {
+      width: 42px;
+      height: 42px;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: var(--surface);
+      color: var(--text-muted);
+      font-size: 1.2rem;
+      cursor: pointer;
+      transition: border-color 0.2s, color 0.2s;
+      flex-shrink: 0;
+    }
+
+    #reset-btn:hover { border-color: var(--accent); color: var(--accent); }
+
     /* ── Footer ─────────────────────────────────── */
     footer {
       text-align: center;
@@ -289,8 +305,9 @@ export function chatPage() {
       </div>
     </div>
 
-    <!-- Query input area: text field + send button -->
+    <!-- Query input area: text field + send/reset buttons -->
     <div id="input-area">
+      <button id="reset-btn" title="Nieuw gesprek" aria-label="Nieuw gesprek" style="display:none;">&#x21bb;</button>
       <textarea id="query-input" placeholder="Stel een vraag..." autocomplete="off" rows="1"></textarea>
       <button id="send-btn">Verstuur</button>
     </div>
@@ -312,6 +329,8 @@ export function chatPage() {
     const input = document.getElementById('query-input');
     /** @type {HTMLButtonElement} The send button */
     const sendBtn = document.getElementById('send-btn');
+    /** @type {HTMLButtonElement} The reset button */
+    const resetBtn = document.getElementById('reset-btn');
 
     /**
      * Conversation history — stores previous { query, answer } pairs.
@@ -319,6 +338,50 @@ export function chatPage() {
      * the LLM has context for follow-up questions.
      */
     const history = [];
+
+    /**
+     * Session storage key for persisting conversation across navigations.
+     */
+    const STORAGE_KEY = 'chatjpt_conversation';
+
+    /**
+     * Saves current conversation state (history + displayed messages) to
+     * sessionStorage so it survives page navigations within the same tab.
+     */
+    function saveConversation() {
+      try {
+        sessionStorage.setItem(STORAGE_KEY, JSON.stringify(history));
+      } catch { /* Storage full or unavailable — silently degrade */ }
+    }
+
+    /**
+     * Restores a previous conversation from sessionStorage.
+     * Re-renders all messages and rebuilds the history array.
+     */
+    function restoreConversation() {
+      try {
+        const saved = sessionStorage.getItem(STORAGE_KEY);
+        if (!saved) return;
+        const entries = JSON.parse(saved);
+        if (!Array.isArray(entries) || entries.length === 0) return;
+
+        // Remove the default greeting — we'll replay the conversation
+        messages.innerHTML = '';
+
+        for (const entry of entries) {
+          addMessage('user', entry.query);
+          const msgEl = addMessage('assistant', entry.answer);
+          if (entry.sources) addSources(msgEl, entry.sources);
+          history.push(entry);
+        }
+
+        // Show reset button when there's conversation to clear
+        resetBtn.style.display = '';
+      } catch {
+        // Corrupted data — clear it and start fresh
+        sessionStorage.removeItem(STORAGE_KEY);
+      }
+    }
 
     // ────────────────────────────────────────────
     // Utility Functions
@@ -490,6 +553,7 @@ export function chatPage() {
           // Create an empty message bubble that we'll fill token by token
           const msgEl = addMessage('assistant', '');
           let fullAnswer = '';
+          let lastSources = null;
 
           // Read the SSE stream using a ReadableStream reader
           const reader = res.body.getReader();
@@ -528,6 +592,7 @@ export function chatPage() {
 
                 // Source citations (sent in the final SSE message)
                 if (data.sources) {
+                  lastSources = data.sources;
                   addSources(msgEl, data.sources);
                 }
 
@@ -542,7 +607,9 @@ export function chatPage() {
           }
 
           // Store this exchange for conversation history
-          history.push({ query, answer: fullAnswer });
+          history.push({ query, answer: fullAnswer, sources: lastSources });
+          resetBtn.style.display = '';
+          saveConversation();
 
         } else {
           // ── JSON Fallback Mode ──────────────────
@@ -552,7 +619,9 @@ export function chatPage() {
           const answer = data.answer || data.summary || 'Geen antwoord gevonden.';
           const msgEl = addMessage('assistant', answer);
           if (data.sources) addSources(msgEl, data.sources);
-          history.push({ query, answer });
+          history.push({ query, answer, sources: data.sources || null });
+          resetBtn.style.display = '';
+          saveConversation();
         }
       } catch (err) {
         // Network error or other unexpected failure
@@ -569,10 +638,22 @@ export function chatPage() {
     // Event Listeners
     // ────────────────────────────────────────────
 
+    // Restore any previous conversation from this browser tab
+    restoreConversation();
+
     // Send on button click
     sendBtn.addEventListener('click', () => {
       const q = input.value.trim();
       if (q) ask(q);
+    });
+
+    // Reset: clear conversation and start fresh
+    resetBtn.addEventListener('click', () => {
+      history.length = 0;
+      sessionStorage.removeItem(STORAGE_KEY);
+      messages.innerHTML = '<div class="message assistant">Dit is ChatJPT, de AI die alles weet wat Cityguys ooit heeft opgeschreven. \u{1F354} Burgers, \u{1F37A} bars, \u{1F3D9}\uFE0F citytrips, noem het maar. Vraag maar raak.</div>';
+      resetBtn.style.display = 'none';
+      input.focus();
     });
 
     // Auto-resize textarea as content changes
