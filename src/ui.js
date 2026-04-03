@@ -228,7 +228,7 @@ export function chatPage() {
     #query-input {
       flex: 1;
       height: 42px;
-      padding: 0 1rem;
+      padding: 0.575rem 1rem;
       border: 1px solid var(--border);
       border-radius: 24px;
       font-size: 0.95rem;
