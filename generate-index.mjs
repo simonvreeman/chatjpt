@@ -14,8 +14,10 @@
  * 1. Fetch sitemap(s) → discover all indexable URLs
  * 2. Fetch markdown for each URL → Cloudflare Browser Rendering API
  * 3. Build records → clean text, extract titles, create schema.org objects
- * 4. Generate embeddings → Cloudflare Workers AI (BGE model, 768 dimensions)
- * 5. Write output → JSON + ESM index files
+ * 4. Enrich records → extract structured metadata via Workers AI (cached)
+ * 5. Build normalization map → cluster synonyms via LLM
+ * 6. Generate embeddings → Cloudflare Workers AI (BGE model, 768 dimensions)
+ * 7. Write output → JSON + ESM index files
  *
  * Caching strategy:
  * - **Markdown cache** (markdown-cache.json): Maps URL → markdown text.
@@ -98,6 +100,8 @@ const outputModulePath = path.join(outputDir, `${config.indexFile}.mjs`);
 const embeddingCachePath = path.join(outputDir, 'embedding-cache.json');
 /** Path for the markdown cache (maps URLs → fetched markdown text) */
 const markdownCachePath = path.join(outputDir, 'markdown-cache.json');
+const enrichmentCachePath = path.join(outputDir, 'enrichment-cache.json');
+const normalizationMapPath = path.join(outputDir, 'normalization-map.json');
 
 // ── Cloudflare API credentials ───────────────
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
@@ -108,6 +112,9 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN;
 const EMBEDDING_MODEL = config.embeddingModel;
 /** Maximum characters of document text sent to the embedding model */
 const MAX_EMBED_CHARS = config.maxEmbedChars;
+const CHAT_MODEL = config.chatModel;
+/** Maximum characters of article text sent to the enrichment model (balances context quality vs token cost) */
+const MAX_ENRICH_CHARS = 4000;
 
 /**
  * Pre-compiled regex patterns for URL exclusion.
@@ -116,6 +123,13 @@ const MAX_EMBED_CHARS = config.maxEmbedChars;
 const EXCLUDE_PATTERNS = (config.crawl.excludePatterns || []).map(
   (p) => new RegExp(p, 'i')
 );
+
+let ENRICHMENT_PROMPT;
+try {
+  ENRICHMENT_PROMPT = await fs.readFile(path.join(rootDir, 'src', 'enrichment-prompt.md'), 'utf8');
+} catch {
+  console.warn('Warning: src/enrichment-prompt.md not found. Enrichment will be skipped.');
+}
 
 // ============================================================
 // Sitemap Fetching
@@ -549,6 +563,310 @@ async function saveCache(cache) {
 }
 
 // ──────────────────────────────────────────────
+// Enrichment Cache Management
+// ──────────────────────────────────────────────
+
+async function loadEnrichmentCache() {
+  try {
+    return JSON.parse(await fs.readFile(enrichmentCachePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+async function saveEnrichmentCache(cache) {
+  await fs.writeFile(enrichmentCachePath, JSON.stringify(cache), 'utf8');
+}
+
+// ──────────────────────────────────────────────
+// Article Enrichment via Workers AI
+// ──────────────────────────────────────────────
+
+async function fetchEnrichment(text) {
+  const truncated = text.slice(0, MAX_ENRICH_CHARS);
+
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CHAT_MODEL}`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CF_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: ENRICHMENT_PROMPT },
+          { role: 'user', content: truncated },
+        ],
+        max_tokens: 1024,
+        temperature: 0.1,
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error(`  Enrichment HTTP ${res.status}: ${text.slice(0, 200)}`);
+    return null;
+  }
+
+  const data = await res.json();
+  if (!data.success || !data.result?.response) {
+    console.error(`  Enrichment API error: ${JSON.stringify(data.errors || []).slice(0, 200)}`);
+    return null;
+  }
+
+  const response = data.result.response;
+  if (typeof response === 'object') return response;
+
+  try {
+    return JSON.parse(response.trim());
+  } catch {
+    const match = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (match) {
+      try { return JSON.parse(match[1].trim()); } catch { /* fall through */ }
+    }
+    console.error(`  Enrichment: invalid JSON response`);
+    return null;
+  }
+}
+
+async function fetchEnrichmentWithRetry(text) {
+  const result = await fetchEnrichment(text);
+  if (result !== null) return result;
+  await new Promise(r => setTimeout(r, 3000));
+  return fetchEnrichment(text);
+}
+
+const EMPTY_METADATA = {
+  city: null,
+  neighborhoods: [],
+  places: [],
+  dishes: [],
+  categories: [],
+  cuisine_type: [],
+  occasion: [],
+};
+
+async function enrichRecords(records) {
+  if (!ENRICHMENT_PROMPT) {
+    console.log('  Skipping enrichment (enrichment prompt not loaded)');
+    return records.map(() => ({ ...EMPTY_METADATA }));
+  }
+
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+    console.log('  Skipping enrichment (credentials not set)');
+    return records.map(() => ({ ...EMPTY_METADATA }));
+  }
+
+  const cache = await loadEnrichmentCache();
+  const toEnrich = [];
+  const metadata = new Array(records.length);
+
+  for (let i = 0; i < records.length; i++) {
+    const hash = contentHash(records[i].text);
+    if (cache[records[i].id]?.hash === hash) {
+      metadata[i] = cache[records[i].id].metadata;
+    } else {
+      toEnrich.push({ index: i, hash, id: records[i].id });
+    }
+  }
+
+  const cached = records.length - toEnrich.length;
+  if (cached > 0) console.log(`  Enrichment cache: ${cached} cached, ${toEnrich.length} to enrich`);
+
+  let failed = 0;
+
+  for (let i = 0; i < toEnrich.length; i++) {
+    const item = toEnrich[i];
+    const record = records[item.index];
+
+    const result = await fetchEnrichmentWithRetry(record.text);
+    if (result) {
+      metadata[item.index] = result;
+      cache[item.id] = { hash: item.hash, metadata: result };
+    } else {
+      failed++;
+      metadata[item.index] = { ...EMPTY_METADATA };
+      cache[item.id] = { hash: item.hash, metadata: { ...EMPTY_METADATA } };
+    }
+
+    if ((i + 1) % 50 === 0 || i === toEnrich.length - 1) {
+      console.log(`  Enrichment: ${i + 1}/${toEnrich.length} (${failed} failed)`);
+    }
+
+    if ((i + 1) % 50 === 0) await saveEnrichmentCache(cache);
+
+    if (i < toEnrich.length - 1) {
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+
+  await saveEnrichmentCache(cache);
+
+  if (failed > 0) console.log(`  Enrichment complete: ${failed} articles failed (stored with empty metadata)`);
+
+  return metadata;
+}
+
+// ============================================================
+// Normalization Map
+// ============================================================
+
+async function loadNormalizationMap() {
+  try {
+    return JSON.parse(await fs.readFile(normalizationMapPath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function collectUniqueValues(metadataList, fields) {
+  const values = new Set();
+  for (const meta of metadataList) {
+    for (const field of fields) {
+      const arr = meta[field];
+      if (Array.isArray(arr)) {
+        arr.forEach(v => { if (typeof v === 'string' && v.trim()) values.add(v.trim().toLowerCase()); });
+      }
+    }
+  }
+  return values;
+}
+
+async function buildNormalizationMap(metadataList) {
+  const fieldsToNormalize = ['categories', 'cuisine_type', 'occasion', 'dishes'];
+  const allValues = collectUniqueValues(metadataList, fieldsToNormalize);
+  const existingMap = await loadNormalizationMap();
+  const knownValues = new Set(Object.keys(existingMap).concat(Object.values(existingMap)));
+
+  const newValues = [...allValues].filter(v => !knownValues.has(v));
+
+  if (newValues.length === 0) {
+    console.log('  Normalization: no new values found, reusing existing map');
+    return existingMap;
+  }
+
+  console.log(`  Normalization: ${newValues.length} new values found, running LLM clustering...`);
+
+  // Send the full value set (not just new values) so the LLM can cluster consistently
+  // across all terms. Sending only new values would miss cross-cluster relationships.
+  const allValuesList = [...allValues].sort();
+
+  const prompt = `Je krijgt een lijst met termen die zijn geëxtraheerd uit artikelen. Groepeer synoniemen en varianten onder één gestandaardiseerde term (bij voorkeur Nederlands).
+
+Regels:
+- Antwoord met ALLEEN valid JSON. Geen uitleg, geen markdown fencing.
+- Het JSON object mapt elke variant naar de gestandaardiseerde term: {"variant": "standaard", ...}
+- Termen die al gestandaardiseerd zijn hoeven niet in het resultaat.
+- Gebruik Nederlandse termen als standaard waar mogelijk (bijv. "dinner" → "diner", "Italian" → "Italiaans").
+- Houd termen die duidelijk verschillend zijn apart (bijv. "koffie" en "cocktails" zijn geen synoniemen).
+
+Termen om te clusteren:
+${allValuesList.join(', ')}`;
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CHAT_MODEL}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CF_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [
+            { role: 'system', content: 'Je bent een taalkundige assistent die synoniemen clustert.' },
+            { role: 'user', content: prompt },
+          ],
+          max_tokens: 4096,
+          temperature: 0.1,
+        }),
+      }
+    );
+
+    if (!res.ok) {
+      console.warn(`  Normalization: HTTP ${res.status}`);
+      return existingMap;
+    }
+
+    const data = await res.json();
+    if (!data.success || !data.result?.response) {
+      console.warn('  Normalization: LLM call failed, keeping existing map');
+      return existingMap;
+    }
+
+    const response = data.result.response;
+    let newMap;
+    if (typeof response === 'object') {
+      newMap = response;
+    } else {
+      try {
+        newMap = JSON.parse(response.trim());
+      } catch {
+        const match = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (match) {
+          try { newMap = JSON.parse(match[1].trim()); } catch { /* fall through */ }
+        }
+      }
+    }
+
+    if (!newMap || typeof newMap !== 'object') {
+      console.warn('  Normalization: could not parse LLM response, keeping existing map');
+      return existingMap;
+    }
+
+    const merged = { ...existingMap, ...newMap };
+    await fs.writeFile(normalizationMapPath, JSON.stringify(merged, null, 2), 'utf8');
+    console.log(`  Normalization: ${Object.keys(newMap).length} mappings from LLM, ${Object.keys(merged).length} total`);
+    return merged;
+
+  } catch (err) {
+    console.warn(`  Normalization: error — ${err.message}. Keeping existing map`);
+    return existingMap;
+  }
+}
+
+function applyNormalization(metadata, normMap) {
+  const normalize = (arr) => {
+    if (!Array.isArray(arr)) return arr;
+    return arr.map(v => {
+      const key = typeof v === 'string' ? v.trim().toLowerCase() : v;
+      return normMap[key] || v;
+    });
+  };
+
+  return {
+    ...metadata,
+    categories_normalized: normalize(metadata.categories),
+    cuisine_type_normalized: normalize(metadata.cuisine_type),
+    occasion_normalized: normalize(metadata.occasion),
+    dishes_normalized: normalize(metadata.dishes),
+  };
+}
+
+function buildKeywords(metadata) {
+  const keywords = new Set();
+
+  if (Array.isArray(metadata.places)) {
+    metadata.places.forEach(p => {
+      if (p?.name) keywords.add(p.name);
+    });
+  }
+
+  const dishes = metadata.dishes_normalized || metadata.dishes || [];
+  dishes.forEach(d => { if (d) keywords.add(d); });
+
+  const cats = metadata.categories_normalized || metadata.categories || [];
+  cats.forEach(c => { if (c) keywords.add(c); });
+
+  const cuisines = metadata.cuisine_type_normalized || metadata.cuisine_type || [];
+  cuisines.forEach(c => { if (c) keywords.add(c); });
+
+  return [...keywords];
+}
+
+// ──────────────────────────────────────────────
 // Cloudflare Workers AI Embedding API
 // ──────────────────────────────────────────────
 
@@ -657,21 +975,21 @@ async function generateEmbeddings(records) {
  * 3. Fetch sitemap URLs and filter by exclude patterns
  * 4. Fetch markdown for each page (with caching + rate limiting)
  * 5. Build index records (clean text, extract titles, assign types)
- * 6. Filter out "thin" pages (< 50 chars of clean text)
- * 7. Generate embeddings (with caching + batching)
- * 8. Write output files (JSON + ESM)
+ * 6. Enrich records with structured metadata via Workers AI (cached)
+ * 7. Build normalization map (cluster synonyms via LLM)
+ * 8. Attach metadata to records and populate keywords
+ * 9. Generate embeddings (with caching + batching)
+ * 10. Write output files (JSON + ESM)
  *
  * The entire process is idempotent: running it multiple times with warm
  * caches produces the same output, and only processes changed content.
  */
 async function main() {
-  // Validate required credentials
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
     console.error('Set CF_ACCOUNT_ID and CF_API_TOKEN environment variables.');
     process.exit(1);
   }
 
-  // Ensure output directory exists (creates recursively if needed)
   await fs.mkdir(outputDir, { recursive: true });
 
   // Step 1: Discover all indexable URLs from the sitemap
@@ -686,26 +1004,42 @@ async function main() {
   const records = pages
     .filter((p) => p.markdown && cleanMarkdown(p.markdown).length > 50)
     .map(buildRecord);
-  // Sort by publication date (newest first) for consistent ordering
   records.sort((a, b) => (b.datePublished || '').localeCompare(a.datePublished || ''));
   console.log(`Built ${records.length} index records (filtered out ${pages.length - records.length} thin pages)`);
 
-  // Step 4: Generate vector embeddings (cached — only new/changed content)
+  // Step 4: Enrich records with structured metadata (cached — only new/changed content)
+  console.log(`\nEnriching ${records.length} records with metadata...`);
+  const metadataList = await enrichRecords(records);
+
+  // Step 5: Build normalization map from enrichment output
+  console.log(`\nBuilding normalization map...`);
+  const normMap = await buildNormalizationMap(metadataList);
+
+  // Step 6: Attach metadata to records and populate keywords
+  for (let i = 0; i < records.length; i++) {
+    const normalizedMeta = applyNormalization(metadataList[i], normMap);
+    records[i].metadata = normalizedMeta;
+    records[i].keywords = buildKeywords(normalizedMeta);
+  }
+
+  // Step 7: Generate vector embeddings (cached — only new/changed content)
   console.log(`\nGenerating embeddings for ${records.length} records...`);
   const embeddings = await generateEmbeddings(records);
-  // Attach embeddings to their corresponding records
   for (let i = 0; i < records.length; i++) {
     records[i].embedding = embeddings[i];
   }
 
-  // Step 5: Write the index files
+  // Step 8: Write the index files
   const json = JSON.stringify(records, null, 2) + '\n';
-  await fs.writeFile(outputJsonPath, json, 'utf8');         // Raw JSON (for debugging)
-  await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');  // ESM module
+  await fs.writeFile(outputJsonPath, json, 'utf8');
+  await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');
 
   // Summary
   const sizeKB = Math.round(Buffer.byteLength(json) / 1024);
+  const enriched = metadataList.filter(m => m.city !== null).length;
   console.log(`\nGenerated ChatJPT index: ${records.length} records (${sizeKB}KB)`);
+  console.log(`  Enriched: ${enriched}/${records.length} articles with metadata`);
+  console.log(`  Normalization map: ${Object.keys(normMap).length} mappings`);
 }
 
 // Run the pipeline and exit on error
