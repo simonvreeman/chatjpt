@@ -59,9 +59,9 @@ export function chatPage() {
     @media (prefers-color-scheme: dark) {
       :root {
         --bg: #010017;
-        --surface: #0a0a2a;
-        --surface2: #12123a;
-        --border: #1e1e4a;
+        --surface: #030030;
+        --surface2: #0a0a3a;
+        --border: #1a1a4a;
         --text: #e5e5e5;
         --text-muted: #a3a3a3;
         --accent: #FF2D78;
