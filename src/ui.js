@@ -227,7 +227,8 @@ export function chatPage() {
     /* Text input: pill-shaped with subtle border, auto-expands */
     #query-input {
       flex: 1;
-      padding: 0.75rem 1rem;
+      height: 42px;
+      padding: 0 1rem;
       border: 1px solid var(--border);
       border-radius: 24px;
       font-size: 0.95rem;
@@ -247,7 +248,8 @@ export function chatPage() {
 
     /* Send button: pill-shaped accent button */
     #send-btn {
-      padding: 0.75rem 1.25rem;
+      height: 42px;
+      padding: 0 1.25rem;
       background: var(--accent);
       color: #fff;
       border: none;
