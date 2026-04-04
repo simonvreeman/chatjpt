@@ -251,6 +251,128 @@ export async function embedQuery(ai, query) {
 }
 
 // ──────────────────────────────────────────────
+// Vectorize Query with Progressive Filter Relaxation
+// ──────────────────────────────────────────────
+
+/**
+ * Builds a Vectorize metadata filter object from filter hints.
+ * Returns null if no filters are applicable (pure semantic search).
+ *
+ * Vectorize v2 filter syntax:
+ *   { fieldName: { $eq: value } }          — scalar equality
+ *   { fieldName: { $in: [v1, v2] } }       — array membership
+ *   Multiple fields are implicitly ANDed.
+ *
+ * Note: neighborhood is NOT a Vectorize dimension (stored in D1 only).
+ *
+ * @param {Object} hints - Filter hints subset (only Vectorize-filterable dims).
+ * @returns {Object|null} Vectorize filter object or null.
+ */
+function buildVectorizeFilter(hints) {
+  const filter = {};
+  if (hints.city) filter.city = { $eq: hints.city };
+  if (hints.categories?.length) filter.categories = { $in: hints.categories };
+  if (hints.cuisine_type?.length) filter.cuisine_type = { $in: hints.cuisine_type };
+  if (hints.occasion?.length) filter.occasion = { $in: hints.occasion };
+  return Object.keys(filter).length > 0 ? filter : null;
+}
+
+/**
+ * Queries the Vectorize index with progressive filter relaxation.
+ *
+ * Relaxation order (drops one level at a time until ≥5 results):
+ *   1. All filters (city + categories + cuisine_type + occasion)
+ *   2. Drop occasion
+ *   3. Drop categories + cuisine_type
+ *   4. Drop city (pure semantic)
+ *
+ * Neighborhood is not a Vectorize filter (stored in D1 only).
+ * It is tracked in relaxedFilters so generation can explain it.
+ *
+ * @param {Object} env - Worker environment bindings (needs env.VECTORIZE).
+ * @param {number[]|null} embedding - Query embedding vector (null = no semantic).
+ * @param {Object} filterHints - Intent hints from parseQueryIntent.
+ * @param {number} [topK=50] - Number of candidates to retrieve per Vectorize call.
+ * @returns {Promise<{ ids: string[], relaxedFilters: string[] }>}
+ */
+export async function queryVectorize(env, embedding, filterHints, topK = 50) {
+  if (!env?.VECTORIZE) return { ids: [], relaxedFilters: [] };
+
+  const relaxedFilters = [];
+  // Neighborhood is D1-only — mark as relaxed up-front so generation can explain
+  if (filterHints.neighborhood) relaxedFilters.push('neighborhood');
+
+  // Build progressive filter stages (each drops one more dimension)
+  const stages = [
+    { city: filterHints.city, categories: filterHints.categories, cuisine_type: filterHints.cuisine_type, occasion: filterHints.occasion },
+    { city: filterHints.city, categories: filterHints.categories, cuisine_type: filterHints.cuisine_type },
+    { city: filterHints.city },
+    {},
+  ];
+
+  // Deduplicate stages (e.g. if filterHints had no occasion, stages 1 and 2 are identical)
+  const seen = new Set();
+  const uniqueStages = stages.filter((s) => {
+    const key = JSON.stringify(s);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  // Names of the dimensions being dropped at each relaxation step
+  const dropNames = ['occasion', 'categories', 'city'];
+  // Track whether each dimension was actually set (so we only report real relaxations)
+  const wasSet = {
+    occasion:   !!filterHints.occasion?.length,
+    categories: !!(filterHints.categories?.length || filterHints.cuisine_type?.length),
+    city:       !!filterHints.city,
+  };
+
+  // Zero vector fallback for metadata-only queries (when no embedding available)
+  const zeroVector = new Array(768).fill(0);
+  const queryVector = Array.isArray(embedding) ? embedding : zeroVector;
+
+  let dropIndex = 0;
+
+  for (let i = 0; i < uniqueStages.length; i++) {
+    const filter = buildVectorizeFilter(uniqueStages[i]);
+    const queryOptions = { topK, returnMetadata: 'none' };
+    if (filter) queryOptions.filter = filter;
+
+    let matches = [];
+    try {
+      const result = await env.VECTORIZE.query(queryVector, queryOptions);
+      matches = result?.matches || [];
+    } catch {
+      matches = [];
+    }
+
+    if (matches.length >= 5) {
+      return { ids: matches.map((m) => m.id), relaxedFilters };
+    }
+
+    // Record what we're about to drop for the next stage
+    if (dropIndex < dropNames.length) {
+      const dropped = dropNames[dropIndex];
+      if (wasSet[dropped]) relaxedFilters.push(dropped);
+      dropIndex++;
+    }
+  }
+
+  // All stages exhausted with < 5 results — return whatever we got from the last stage
+  const filter = buildVectorizeFilter({});
+  const queryOptions = { topK, returnMetadata: 'none' };
+  let matches = [];
+  try {
+    const result = await env.VECTORIZE.query(queryVector, queryOptions);
+    matches = result?.matches || [];
+  } catch {
+    matches = [];
+  }
+  return { ids: matches.map((m) => m.id), relaxedFilters };
+}
+
+// ──────────────────────────────────────────────
 // Intent Parsing (Structured Filter Extraction)
 // ──────────────────────────────────────────────
 
