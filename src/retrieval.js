@@ -333,22 +333,22 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
   const queryVector = Array.isArray(embedding) ? embedding : zeroVector;
 
   let dropIndex = 0;
+  let lastMatches = [];
 
   for (let i = 0; i < uniqueStages.length; i++) {
     const filter = buildVectorizeFilter(uniqueStages[i]);
     const queryOptions = { topK, returnMetadata: 'none' };
     if (filter) queryOptions.filter = filter;
 
-    let matches = [];
     try {
       const result = await env.VECTORIZE.query(queryVector, queryOptions);
-      matches = result?.matches || [];
+      lastMatches = result?.matches || [];
     } catch {
-      matches = [];
+      lastMatches = [];
     }
 
-    if (matches.length >= 5) {
-      return { ids: matches.map((m) => m.id), relaxedFilters };
+    if (lastMatches.length >= 5) {
+      return { ids: lastMatches.map((m) => m.id), relaxedFilters };
     }
 
     // Record what we're about to drop for the next stage
@@ -359,17 +359,8 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
     }
   }
 
-  // All stages exhausted with < 5 results — return whatever we got from the last stage
-  const filter = buildVectorizeFilter({});
-  const queryOptions = { topK, returnMetadata: 'none' };
-  let matches = [];
-  try {
-    const result = await env.VECTORIZE.query(queryVector, queryOptions);
-    matches = result?.matches || [];
-  } catch {
-    matches = [];
-  }
-  return { ids: matches.map((m) => m.id), relaxedFilters };
+  // All stages exhausted — return whatever the last stage gave us
+  return { ids: lastMatches.map((m) => m.id), relaxedFilters };
 }
 
 // ──────────────────────────────────────────────
