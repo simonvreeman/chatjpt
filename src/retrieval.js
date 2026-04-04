@@ -193,38 +193,6 @@ function scoreDocument(document, tokens, fullQuery) {
 }
 
 // ──────────────────────────────────────────────
-// Semantic Scoring (Vector Similarity)
-// ──────────────────────────────────────────────
-
-/**
- * Computes the cosine similarity between two vectors.
- *
- * Cosine similarity measures the angle between two vectors in high-dimensional
- * space, returning a value from -1 (opposite) to +1 (identical direction).
- * For normalized embedding vectors (which BGE produces), this is equivalent
- * to the dot product.
- *
- * Formula: cos(θ) = (A · B) / (|A| × |B|)
- *
- * Returns 0 if either vector is null/undefined or they have different lengths.
- *
- * @param {number[]} a - First embedding vector (768 dimensions for BGE).
- * @param {number[]} b - Second embedding vector (same dimensionality).
- * @returns {number} Similarity score between -1 and 1 (typically 0 to 1 for embeddings).
- */
-function cosineSimilarity(a, b) {
-  if (!a || !b || a.length !== b.length) return 0;
-  let dot = 0, magA = 0, magB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];     // Dot product accumulator
-    magA += a[i] * a[i];    // Magnitude of vector A (squared)
-    magB += b[i] * b[i];    // Magnitude of vector B (squared)
-  }
-  const mag = Math.sqrt(magA) * Math.sqrt(magB);
-  return mag === 0 ? 0 : dot / mag;
-}
-
-// ──────────────────────────────────────────────
 // Query Embedding
 // ──────────────────────────────────────────────
 
@@ -524,55 +492,52 @@ Respond with ONLY the JSON object, no explanation.`,
 // ──────────────────────────────────────────────
 
 /**
- * Performs hybrid search across the entire index, combining keyword and semantic scores.
+ * Hybrid search using Vectorize (semantic + metadata filters) + D1 (full records) + BM25 re-ranking.
  *
- * Algorithm:
- * 1. Expand query aliases (e.g., abbreviations → full terms)
- * 2. Tokenize the expanded query (lowercase, remove stopwords)
- * 3. For each document in the index:
- *    a. Compute keyword score (BM25-inspired, see scoreDocument)
- *    b. Compute semantic score (cosine similarity with threshold)
- *    c. Combine: (keywordScore + semanticScore) × document.searchWeight
- * 4. Filter out documents with score ≤ 2 (noise threshold)
- * 5. Sort by descending score, return top 8
+ * Pipeline:
+ * 1. Query Vectorize with embedding + metadata filters (with progressive relaxation)
+ * 2. Fetch full article records from D1 by the returned IDs
+ * 3. Re-rank using BM25-inspired keyword scoring on full article text
+ * 4. Filter out zero-score results, sort descending, return top 8
  *
- * Semantic scoring uses a threshold of 0.3: similarities below this are treated
- * as 0 (irrelevant). Above the threshold, the score is scaled to 0–100 range:
- *   semanticScore = max(0, similarity - 0.3) × 100
- * This means a perfect cosine similarity of 1.0 gives a semantic score of 70.
+ * Falls back gracefully:
+ * - No env.VECTORIZE or no env.DB → returns []
+ * - No embedding → metadata-filter-only Vectorize query (zero vector)
  *
  * @param {string} query - The user's search query.
- * @param {number[]|null} queryEmbedding - Query embedding vector (null = keyword-only).
- * @param {Object[]} index - The full search index (array of document records).
- * @returns {Object[]} Top 8 results, each with { document, score, keywordScore, semanticScore }.
+ * @param {number[]|null} queryEmbedding - Query embedding vector (null = no semantic).
+ * @param {Object} env - Worker environment bindings (env.VECTORIZE + env.DB).
+ * @param {Object} [filterHints={}] - Structured filters from parseQueryIntent.
+ * @returns {Promise<Object[]>} Top 8 results: { document, score, keywordScore, semanticScore, relaxedFilters }.
  */
-export function search(query, queryEmbedding, index) {
+export async function search(query, queryEmbedding, env, filterHints = {}) {
+  if (!env?.VECTORIZE || !env?.DB) return [];
+
   const expanded = expandAliases(query);
   const tokens = tokenize(expanded);
 
-  return index
-    .map((document) => {
-      // Step 1: Keyword-based scoring (BM25-inspired)
-      const keywordScore = scoreDocument(document, tokens, expanded);
+  // Step 1: Vectorize semantic search with filter relaxation
+  const { ids, relaxedFilters } = await queryVectorize(env, queryEmbedding, filterHints);
+  if (!ids.length) return [];
 
-      // Step 2: Semantic similarity scoring (embedding-based)
-      let semanticScore = 0;
-      if (queryEmbedding && document.embedding) {
-        const similarity = cosineSimilarity(queryEmbedding, document.embedding);
-        // Apply threshold: ignore weak similarities (< 0.3), scale the rest to 0–100
-        semanticScore = Math.max(0, similarity - 0.3) * 100;
-      }
+  // Step 2: Fetch full records from D1
+  const articles = await fetchArticlesFromD1(env, ids);
+  if (!articles.length) return [];
 
-      // Step 3: Combine scores with document-level weight multiplier
-      const weight = document.searchWeight ?? 1.0;
-      const score = (keywordScore + semanticScore) * weight;
-      return { document, score, keywordScore, semanticScore };
-    })
-    // Filter out noise (score must exceed minimum threshold)
-    .filter((item) => item.score > 2)
-    // Sort by relevance (highest score first)
+  // Step 3: BM25 re-ranking over the Vectorize candidate set
+  const scored = articles.map((document) => {
+    const keywordScore = scoreDocument(document, tokens, expanded);
+    // Vectorize already handled semantic ranking — semanticScore is 0 here.
+    // Kept in the result shape for debug output consistency.
+    const semanticScore = 0;
+    const weight = document.searchWeight ?? 1.0;
+    const score = (keywordScore + semanticScore) * weight;
+    return { document, score, keywordScore, semanticScore, relaxedFilters };
+  });
+
+  return scored
+    .filter((item) => item.score > 0)
     .sort((a, b) => b.score - a.score)
-    // Return top 8 results
     .slice(0, 8);
 }
 
