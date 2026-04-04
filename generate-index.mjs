@@ -103,6 +103,28 @@ const markdownCachePath = path.join(outputDir, 'markdown-cache.json');
 const enrichmentCachePath = path.join(outputDir, 'enrichment-cache.json');
 const normalizationMapPath = path.join(outputDir, 'normalization-map.json');
 
+// ── CLI / Env output-target flags ────────────
+/**
+ * Control which output targets are written during a generate run.
+ *
+ * CLI flags:    --skip-json  --skip-d1  --skip-vectorize  --d1-local
+ * Env vars:     SKIP_JSON=1  SKIP_D1=1  SKIP_VECTORIZE=1  D1_LOCAL=1
+ *
+ * By default all three targets are active (JSON/ESM + D1 + Vectorize).
+ * Use --skip-* to disable individual targets for incremental migrations.
+ * Use --d1-local to execute against a local D1 SQLite file instead of remote.
+ */
+const _args = process.argv.slice(2);
+const SKIP_JSON      = _args.includes('--skip-json')      || process.env.SKIP_JSON      === '1';
+const SKIP_D1        = _args.includes('--skip-d1')        || process.env.SKIP_D1        === '1';
+const SKIP_VECTORIZE = _args.includes('--skip-vectorize') || process.env.SKIP_VECTORIZE === '1';
+const D1_LOCAL       = _args.includes('--d1-local')       || process.env.D1_LOCAL       === '1';
+
+/** D1 database name — must match wrangler.toml [[d1_databases]] database_name */
+const D1_DATABASE = 'chatjpt-db';
+/** Vectorize index name — must match wrangler.toml [[vectorize]] index_name */
+const VECTORIZE_INDEX = 'chatjpt-vectors';
+
 // ── Cloudflare API credentials ───────────────
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
 const CF_API_TOKEN = process.env.CF_API_TOKEN;
@@ -963,6 +985,239 @@ async function generateEmbeddings(records) {
 }
 
 // ============================================================
+// D1 Seeding
+// ============================================================
+
+/**
+ * Escapes a JavaScript value into a safe SQL literal.
+ * null/undefined → NULL, numbers → bare number, strings → single-quoted
+ * with internal single quotes doubled (standard SQL escaping).
+ *
+ * @param {*} val - The value to escape.
+ * @returns {string} SQL literal fragment.
+ */
+function sqlEscape(val) {
+  if (val === null || val === undefined) return 'NULL';
+  if (typeof val === 'number') return String(val);
+  return "'" + String(val).replace(/'/g, "''") + "'";
+}
+
+/**
+ * Builds INSERT OR REPLACE SQL for one article record plus its places.
+ *
+ * Arrays (keywords, neighborhoods, categories, cuisine_type, occasion, dishes)
+ * are stored as JSON strings so they can be queried with json_each() in SQLite.
+ * schema_object is serialized as a JSON string for the same reason.
+ *
+ * @param {Object} record - Fully-assembled index record (with .metadata attached).
+ * @returns {string} One or more SQL statements ending with newlines.
+ */
+function recordToSQL(record) {
+  const meta = record.metadata || {};
+  const places = Array.isArray(meta.places) ? meta.places : [];
+
+  const cats      = meta.categories_normalized  || meta.categories   || [];
+  const cuisines  = meta.cuisine_type_normalized || meta.cuisine_type || [];
+  const occasions = meta.occasion_normalized     || meta.occasion     || [];
+  const dishes    = meta.dishes_normalized       || meta.dishes       || [];
+
+  const articleSQL = `INSERT OR REPLACE INTO articles ` +
+    `(id, url, site, name, type, description, date_published, keywords, ` +
+    `search_weight, text, schema_object, city, neighborhoods, categories, ` +
+    `cuisine_type, occasion, dishes, content_hash) VALUES (` +
+    [
+      sqlEscape(record.id),
+      sqlEscape(record.url),
+      sqlEscape(record.site),
+      sqlEscape(record.name),
+      sqlEscape(record.type),
+      sqlEscape(record.description),
+      sqlEscape(record.datePublished),
+      sqlEscape(JSON.stringify(record.keywords || [])),
+      record.searchWeight ?? 1.0,
+      sqlEscape(record.text),
+      sqlEscape(JSON.stringify(record.schema_object || null)),
+      sqlEscape(meta.city || null),
+      sqlEscape(JSON.stringify(Array.isArray(meta.neighborhoods) ? meta.neighborhoods : [])),
+      sqlEscape(JSON.stringify(cats)),
+      sqlEscape(JSON.stringify(cuisines)),
+      sqlEscape(JSON.stringify(occasions)),
+      sqlEscape(JSON.stringify(dishes)),
+      sqlEscape(contentHash(record.text)),
+    ].join(', ') + `);`;
+
+  const placesLines = places
+    .filter((p) => p?.name)
+    .map((p) =>
+      `INSERT OR REPLACE INTO article_places (article_id, name, neighborhood) VALUES (` +
+      `${sqlEscape(record.id)}, ${sqlEscape(p.name)}, ${sqlEscape(p.neighborhood || null)});`
+    );
+
+  return [articleSQL, ...placesLines].join('\n');
+}
+
+/**
+ * Seeds the D1 database with all article records.
+ *
+ * Strategy: generate SQL INSERT OR REPLACE statements in batches of 50 records,
+ * write each batch to a temp SQL file, then execute via `wrangler d1 execute`.
+ * Temp files are deleted after each successful or failed batch.
+ *
+ * Uses --remote by default (production D1). Pass --d1-local / D1_LOCAL=1 for
+ * local SQLite development.
+ *
+ * @param {Object[]} records - Fully-assembled index records with .metadata.
+ */
+async function seedD1(records) {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const wranglerBin = path.join(rootDir, 'node_modules', '.bin', 'wrangler');
+  const remoteFlag = D1_LOCAL ? '--local' : '--remote';
+  const BATCH_SIZE = 50;
+  let seeded = 0;
+  let failed = 0;
+
+  console.log(`\nSeeding D1 (${D1_DATABASE}) with ${records.length} articles [${remoteFlag}]...`);
+
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(records.length / BATCH_SIZE);
+    const chunk = records.slice(i, i + BATCH_SIZE);
+    const sql = chunk.map(recordToSQL).join('\n') + '\n';
+    const tmpFile = path.join(outputDir, `_d1-seed-${batchNum}.sql`);
+
+    await fs.writeFile(tmpFile, sql, 'utf8');
+
+    try {
+      await execFileAsync(wranglerBin, [
+        'd1', 'execute', D1_DATABASE,
+        '--file', tmpFile,
+        remoteFlag,
+        '--yes',   // skip interactive confirmation prompts
+      ]);
+      seeded += chunk.length;
+      console.log(`  D1 batch ${batchNum}/${totalBatches}: ${chunk.length} articles OK (${seeded} total)`);
+    } catch (err) {
+      failed += chunk.length;
+      // Extract the meaningful part of wrangler's stderr for the log
+      const detail = (err.stderr || err.message || '').split('\n').find((l) => l.trim()) || '';
+      console.error(`  D1 batch ${batchNum}/${totalBatches} FAILED: ${detail}`);
+    } finally {
+      await fs.unlink(tmpFile).catch(() => {});
+    }
+  }
+
+  console.log(`  D1 seeding complete: ${seeded} seeded, ${failed} failed`);
+}
+
+// ============================================================
+// Vectorize Upsert
+// ============================================================
+
+/**
+ * Upserts embeddings + metadata to the Cloudflare Vectorize index.
+ *
+ * Uses the Vectorize v2 REST API which accepts NDJSON (application/x-ndjson).
+ * Each line is a JSON object: { id, values, metadata }.
+ *
+ * Metadata stored per vector (for filtering at query time):
+ *   site, type, name, city, categories, cuisine_type, occasion
+ * Arrays are stored as JSON strings because Vectorize metadata values must be
+ * scalars (string | number | boolean) — not nested arrays/objects.
+ *
+ * Batches of up to 500 vectors per request (Vectorize v2 limit is 1000;
+ * 500 is a safe default given large 768-dim float arrays).
+ *
+ * @param {Object[]} records - Fully-assembled index records with .metadata.
+ * @param {(number[]|null)[]} embeddings - Parallel array of 768-dim embeddings.
+ */
+async function upsertVectorize(records, embeddings) {
+  const BATCH_SIZE = 500;
+
+  // Pair records with their embeddings; skip any with null embeddings
+  const pairs = records
+    .map((r, i) => ({ record: r, embedding: embeddings[i] }))
+    .filter((p) => Array.isArray(p.embedding));
+
+  if (pairs.length === 0) {
+    console.log('\nVectorize: no embeddings to upsert (all null — skipping)');
+    return;
+  }
+
+  console.log(`\nUpserting ${pairs.length} vectors to Vectorize (${VECTORIZE_INDEX})...`);
+  let upserted = 0;
+
+  for (let i = 0; i < pairs.length; i += BATCH_SIZE) {
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(pairs.length / BATCH_SIZE);
+    const batch = pairs.slice(i, i + BATCH_SIZE);
+
+    const ndjson = batch.map(({ record, embedding }) => {
+      const meta = record.metadata || {};
+      const cats      = meta.categories_normalized  || meta.categories   || [];
+      const cuisines  = meta.cuisine_type_normalized || meta.cuisine_type || [];
+      const occasions = meta.occasion_normalized     || meta.occasion     || [];
+      return JSON.stringify({
+        id: record.id,
+        values: embedding,
+        metadata: {
+          site:         record.site,
+          type:         record.type,
+          name:         record.name,
+          city:         meta.city || '',
+          categories:   cats,
+          cuisine_type: cuisines,
+          occasion:     occasions,
+        },
+      });
+    }).join('\n');
+
+    let retries = 2;
+    while (retries >= 0) {
+      const res = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${VECTORIZE_INDEX}/upsert`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CF_API_TOKEN}`,
+            'Content-Type': 'application/x-ndjson',
+          },
+          body: ndjson,
+        }
+      );
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        if (retries > 0) {
+          console.warn(`  Vectorize batch ${batchNum}/${totalBatches} HTTP ${res.status} — retrying...`);
+          await new Promise((r) => setTimeout(r, 3000));
+          retries--;
+          continue;
+        }
+        console.error(`  Vectorize batch ${batchNum}/${totalBatches} FAILED HTTP ${res.status}: ${body.slice(0, 200)}`);
+        break;
+      }
+
+      const data = await res.json();
+      if (!data.success) {
+        console.error(`  Vectorize batch ${batchNum}/${totalBatches} API error: ${JSON.stringify(data.errors || []).slice(0, 200)}`);
+        break;
+      }
+
+      upserted += batch.length;
+      console.log(`  Vectorize batch ${batchNum}/${totalBatches}: ${batch.length} vectors OK (${upserted} total)`);
+      break;
+    }
+
+    if (i + BATCH_SIZE < pairs.length) await new Promise((r) => setTimeout(r, 500));
+  }
+
+  console.log(`  Vectorize upsert complete: ${upserted}/${pairs.length} vectors`);
+}
+
+// ============================================================
 // Main — Orchestrates the full index generation pipeline
 // ============================================================
 
@@ -970,16 +1225,22 @@ async function generateEmbeddings(records) {
  * Main entry point for the index generation pipeline.
  *
  * Steps:
- * 1. Validate credentials (CF_ACCOUNT_ID + CF_API_TOKEN required)
- * 2. Ensure output directory exists
- * 3. Fetch sitemap URLs and filter by exclude patterns
- * 4. Fetch markdown for each page (with caching + rate limiting)
- * 5. Build index records (clean text, extract titles, assign types)
- * 6. Enrich records with structured metadata via Workers AI (cached)
- * 7. Build normalization map (cluster synonyms via LLM)
- * 8. Attach metadata to records and populate keywords
- * 9. Generate embeddings (with caching + batching)
- * 10. Write output files (JSON + ESM)
+ * 1.  Validate credentials (CF_ACCOUNT_ID + CF_API_TOKEN required)
+ * 2.  Ensure output directory exists
+ * 3.  Fetch sitemap URLs and filter by exclude patterns
+ * 4.  Fetch markdown for each page (with caching + rate limiting)
+ * 5.  Build index records (clean text, extract titles, assign types)
+ * 6.  Enrich records with structured metadata via Workers AI (cached)
+ * 7.  Build normalization map (cluster synonyms via LLM)
+ * 8.  Attach metadata to records and populate keywords
+ * 9.  Generate vector embeddings (with caching + batching)
+ * 10. [unless --skip-json]      Write JSON + ESM index files
+ * 11. [unless --skip-d1]        Seed D1 database via wrangler
+ * 12. [unless --skip-vectorize] Upsert vectors to Vectorize
+ *
+ * All three output targets are active by default (backward-compatible).
+ * Disable individual targets with --skip-json / --skip-d1 / --skip-vectorize
+ * or the corresponding SKIP_JSON / SKIP_D1 / SKIP_VECTORIZE env vars.
  *
  * The entire process is idempotent: running it multiple times with warm
  * caches produces the same output, and only processes changed content.
@@ -989,6 +1250,14 @@ async function main() {
     console.error('Set CF_ACCOUNT_ID and CF_API_TOKEN environment variables.');
     process.exit(1);
   }
+
+  // Log active output targets so the operator knows what will be written
+  const targets = [
+    !SKIP_JSON      && 'json+esm',
+    !SKIP_D1        && `d1(${D1_LOCAL ? 'local' : 'remote'})`,
+    !SKIP_VECTORIZE && 'vectorize',
+  ].filter(Boolean);
+  console.log(`Output targets: ${targets.join(', ') || '(none — all skipped)'}`);
 
   await fs.mkdir(outputDir, { recursive: true });
 
@@ -1029,17 +1298,31 @@ async function main() {
     records[i].embedding = embeddings[i];
   }
 
-  // Step 8: Write the index files
+  // Step 8: Write JSON + ESM index files (backward-compatible output)
   const json = JSON.stringify(records, null, 2) + '\n';
-  await fs.writeFile(outputJsonPath, json, 'utf8');
-  await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');
+  if (!SKIP_JSON) {
+    await fs.writeFile(outputJsonPath, json, 'utf8');
+    await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');
+    const sizeKB = Math.round(Buffer.byteLength(json) / 1024);
+    console.log(`\nWrote JSON + ESM index: ${records.length} records (${sizeKB}KB)`);
+  }
+
+  // Step 9: Seed D1 database
+  if (!SKIP_D1) {
+    await seedD1(records);
+  }
+
+  // Step 10: Upsert embeddings to Vectorize
+  if (!SKIP_VECTORIZE) {
+    await upsertVectorize(records, embeddings);
+  }
 
   // Summary
-  const sizeKB = Math.round(Buffer.byteLength(json) / 1024);
   const enriched = metadataList.filter(m => m.city !== null).length;
-  console.log(`\nGenerated ChatJPT index: ${records.length} records (${sizeKB}KB)`);
+  console.log(`\nChatJPT index complete: ${records.length} records`);
   console.log(`  Enriched: ${enriched}/${records.length} articles with metadata`);
   console.log(`  Normalization map: ${Object.keys(normMap).length} mappings`);
+  console.log(`  Targets written: ${targets.join(', ') || '(none)'}`);
 }
 
 // Run the pipeline and exit on error
