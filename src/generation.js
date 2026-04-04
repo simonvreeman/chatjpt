@@ -181,7 +181,7 @@ export function fallbackSummarize(query, results) {
  * @param {Object[]} prevExchanges - Previous conversation turns: [{ query, answer }].
  * @returns {Object[]} Array of { role, content } message objects for the LLM.
  */
-function buildMessages(query, context, prevExchanges) {
+function buildMessages(query, context, prevExchanges, relaxedFilters = []) {
   const messages = [{ role: 'system', content: SYSTEM_PROMPT }];
 
   // Include up to 3 previous exchanges for conversational continuity
@@ -197,8 +197,30 @@ function buildMessages(query, context, prevExchanges) {
     }
   }
 
-  // Current question with retrieved context
-  messages.push({ role: 'user', content: `Context from ${SITE_NAME}:\n\n${context}\n\nQuestion: ${query}` });
+  // Prepend relaxation note to context when filters were broadened during retrieval
+  let contextWithNote = context;
+  if (relaxedFilters.length > 0) {
+    const noteLines = [];
+    if (relaxedFilters.includes('neighborhood')) {
+      noteLines.push(`Note: geen resultaten gevonden voor de opgegeven buurt. Resultaten zijn verbreed naar de stad.`);
+    }
+    if (relaxedFilters.includes('occasion')) {
+      noteLines.push(`Note: geen resultaten gevonden voor het opgegeven moment/gelegenheid. Resultaten zijn verbreed.`);
+    }
+    if (relaxedFilters.includes('categories')) {
+      noteLines.push(`Note: geen resultaten gevonden voor de opgegeven categorie of keuken. Resultaten zijn verbreed.`);
+    }
+    if (relaxedFilters.includes('city')) {
+      noteLines.push(`Note: geen resultaten gevonden voor de opgegeven stad. Resultaten zijn landelijk verbreed.`);
+    }
+    if (relaxedFilters.includes('all_filters')) {
+      noteLines.push(`Note: geen gefilterde resultaten gevonden. Toont meest relevante resultaten zonder filters.`);
+    }
+    if (noteLines.length) {
+      contextWithNote = noteLines.join('\n') + '\n\n' + context;
+    }
+  }
+  messages.push({ role: 'user', content: `Context from ${SITE_NAME}:\n\n${contextWithNote}\n\nQuestion: ${query}` });
   return messages;
 }
 
@@ -276,7 +298,7 @@ export function extractSources(answer, allSources) {
  * @param {string} sessionId - Unique session/query ID for affinity routing.
  * @returns {Promise<{ stream: ReadableStream|null, fallback?: Object, sources: Object[] }>}
  */
-export async function generateStreamingAnswer(ai, query, scoredResults, prevExchanges, sessionId) {
+export async function generateStreamingAnswer(ai, query, scoredResults, prevExchanges, sessionId, relaxedFilters = []) {
   const { context, sources } = buildContext(scoredResults);
 
   // No context means no results — return keyword-based fallback
@@ -285,7 +307,7 @@ export async function generateStreamingAnswer(ai, query, scoredResults, prevExch
     return { stream: null, fallback };
   }
 
-  const messages = buildMessages(query, context, prevExchanges);
+  const messages = buildMessages(query, context, prevExchanges, relaxedFilters);
 
   // Call LLM with streaming enabled; withTimeout guards against hangs
   const response = await withTimeout(
@@ -333,7 +355,7 @@ export async function generateStreamingAnswer(ai, query, scoredResults, prevExch
  * @param {string} sessionId - Unique session/query ID.
  * @returns {Promise<{ answer: string, sources: Object[] }>}
  */
-export async function generateAnswer(ai, query, scoredResults, prevExchanges, sessionId) {
+export async function generateAnswer(ai, query, scoredResults, prevExchanges, sessionId, relaxedFilters = []) {
   const { context, sources } = buildContext(scoredResults);
 
   // No context = no results → return keyword-based fallback
@@ -342,7 +364,7 @@ export async function generateAnswer(ai, query, scoredResults, prevExchanges, se
   }
 
   try {
-    const messages = buildMessages(query, context, prevExchanges);
+    const messages = buildMessages(query, context, prevExchanges, relaxedFilters);
 
     const response = await withTimeout(
       ai.run(MODEL, {
