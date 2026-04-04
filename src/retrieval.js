@@ -305,7 +305,7 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
 
   for (let i = 0; i < uniqueStages.length; i++) {
     const filter = buildVectorizeFilter(uniqueStages[i]);
-    const queryOptions = { topK, returnMetadata: 'indexed' };
+    const queryOptions = { topK, returnMetadata: 'all' };
     if (filter) queryOptions.filter = filter;
 
     try {
