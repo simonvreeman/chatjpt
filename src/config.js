@@ -54,6 +54,12 @@ export const AI_TIMEOUT_MS = siteConfig.aiTimeoutMs || 10000;
 export const MODEL = siteConfig.chatModel || '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
 
 /**
+ * The Workers AI model used for query intent parsing (extracting structured
+ * filters from the user query). Smaller and faster than the generation model.
+ */
+export const INTENT_MODEL = siteConfig.intentModel || '@cf/meta/llama-3.1-8b-instruct';
+
+/**
  * The embedding model used to convert queries and documents into 768-dimensional
  * vectors for semantic similarity search.
  * Default: BAAI BGE Base EN v1.5 — a compact, high-quality English embedding model.

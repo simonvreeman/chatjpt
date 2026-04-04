@@ -99,6 +99,13 @@ export default {
    */
   chatModel: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',
 
+  /**
+   * Smaller/faster model for query intent extraction.
+   * Intent extraction is a simpler task than generation — an 8B model
+   * is sufficient and adds less latency than the 70B generation model.
+   */
+  intentModel: '@cf/meta/llama-3.1-8b-instruct',
+
   // ──────────────────────────────────────────────
   // Generation Parameters
   // These control the AI answer generation behavior.
