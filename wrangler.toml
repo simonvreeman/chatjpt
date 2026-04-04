@@ -18,3 +18,14 @@ fallthrough = true
 # Workers AI binding -- required for embeddings + LLM
 [ai]
 binding = "AI"
+
+# D1 database binding — article content and metadata
+[[d1_databases]]
+binding = "DB"
+database_name = "chatjpt-db"
+database_id = "2c1b875f-47ba-4c7d-bc29-98488992e646"
+
+# Vectorize index binding — vector search with metadata filtering
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "chatjpt-vectors"

@@ -26,9 +26,8 @@
  */
 
 import config from '../chatjpt.config.mjs';
-import chatjptIndex from './generated/chatjpt-index.mjs';
 import { MAX_QUERY_LENGTH, AI_TIMEOUT_MS, MODEL } from './config.js';
-import { search, embedQuery, augmentQuery } from './retrieval.js';
+import { search, embedQuery, augmentQuery, parseQueryIntent } from './retrieval.js';
 import {
   generateStreamingAnswer, generateAnswer,
   fallbackSummarize, extractSources,
@@ -275,14 +274,6 @@ async function handleAsk(request, env) {
     }, 400);
   }
 
-  // Validate: search index must be loaded and non-empty
-  if (!Array.isArray(chatjptIndex) || chatjptIndex.length === 0) {
-    return json({
-      error: 'Search index is unavailable. Please try again later.',
-      query_id: payload.query_id,
-    }, 503);
-  }
-
   // Step 2: Parse conversation history (if any) for multi-turn support
   let prevExchanges = [];
   if (payload.prev) {
@@ -294,16 +285,22 @@ async function handleAsk(request, env) {
   // Step 3: Augment query with conversation context (for vague follow-ups)
   const searchQuery = augmentQuery(query, prevExchanges);
 
-  // Step 4: Generate query embedding for semantic search
+  // Step 4: Run intent parsing and embedding generation in parallel (independent)
   const ai = env?.AI;
   const embedStart = Date.now();
-  const queryEmbedding = ai ? await embedQuery(ai, searchQuery) : null;
+  const [queryEmbedding, filterHints] = await Promise.all([
+    ai ? embedQuery(ai, searchQuery) : Promise.resolve(null),
+    ai ? parseQueryIntent(ai, query) : Promise.resolve({}),
+  ]);
   const embedMs = Date.now() - embedStart;
 
-  // Step 5: Perform hybrid search (keyword + semantic)
+  // Step 5: Perform hybrid search (Vectorize + D1 + BM25 re-rank)
   const searchStart = Date.now();
-  const scoredResults = search(searchQuery, queryEmbedding, chatjptIndex);
+  const scoredResults = await search(searchQuery, queryEmbedding, env, filterHints);
   const searchMs = Date.now() - searchStart;
+
+  // Extract relaxedFilters from results (all results carry the same value)
+  const relaxedFilters = scoredResults[0]?.relaxedFilters || [];
 
   // Format results for the API response
   const results = scoredResults.map(({ document, score }) => ({
@@ -327,7 +324,7 @@ async function handleAsk(request, env) {
   if (payload.mode === 'stream' && ai) {
     try {
       const { stream, fallback, sources } = await generateStreamingAnswer(
-        ai, query, scoredResults, prevExchanges, payload.query_id
+        ai, query, scoredResults, prevExchanges, payload.query_id, relaxedFilters
       );
 
       // If no stream was returned (e.g., no search results), return JSON fallback
@@ -368,7 +365,7 @@ async function handleAsk(request, env) {
     const genStart = Date.now();
     if (ai) {
       // Use the LLM for answer generation
-      generated = await generateAnswer(ai, query, scoredResults, prevExchanges, payload.query_id);
+      generated = await generateAnswer(ai, query, scoredResults, prevExchanges, payload.query_id, relaxedFilters);
     } else {
       // No AI binding available — use keyword-based fallback
       generated = fallbackSummarize(query, scoredResults.map((r) => r.document));
@@ -400,7 +397,8 @@ async function handleAsk(request, env) {
         keywordScore,              // Keyword-only component
         semanticScore,             // Semantic-only component
       })),
-      index_size: chatjptIndex.length,
+      filter_hints: filterHints,
+      relaxed_filters: relaxedFilters,
       had_embedding: !!queryEmbedding,
       model: MODEL,
     };

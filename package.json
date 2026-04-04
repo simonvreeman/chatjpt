@@ -5,6 +5,9 @@
   "type": "module",
   "scripts": {
     "generate": "node generate-index.mjs",
+    "generate:d1": "node generate-index.mjs --skip-json --skip-vectorize",
+    "generate:vectorize": "node generate-index.mjs --skip-json --skip-d1",
+    "generate:json": "node generate-index.mjs --skip-d1 --skip-vectorize",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

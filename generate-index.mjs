@@ -14,8 +14,10 @@
  * 1. Fetch sitemap(s) → discover all indexable URLs
  * 2. Fetch markdown for each URL → Cloudflare Browser Rendering API
  * 3. Build records → clean text, extract titles, create schema.org objects
- * 4. Generate embeddings → Cloudflare Workers AI (BGE model, 768 dimensions)
- * 5. Write output → JSON + ESM index files
+ * 4. Enrich records → extract structured metadata via Workers AI (cached)
+ * 5. Build normalization map → cluster synonyms via LLM
+ * 6. Generate embeddings → Cloudflare Workers AI (BGE model, 768 dimensions)
+ * 7. Write output → JSON + ESM index files
  *
  * Caching strategy:
  * - **Markdown cache** (markdown-cache.json): Maps URL → markdown text.
@@ -98,6 +100,30 @@ const outputModulePath = path.join(outputDir, `${config.indexFile}.mjs`);
 const embeddingCachePath = path.join(outputDir, 'embedding-cache.json');
 /** Path for the markdown cache (maps URLs → fetched markdown text) */
 const markdownCachePath = path.join(outputDir, 'markdown-cache.json');
+const enrichmentCachePath = path.join(outputDir, 'enrichment-cache.json');
+const normalizationMapPath = path.join(outputDir, 'normalization-map.json');
+
+// ── CLI / Env output-target flags ────────────
+/**
+ * Control which output targets are written during a generate run.
+ *
+ * CLI flags:    --skip-json  --skip-d1  --skip-vectorize  --d1-local
+ * Env vars:     SKIP_JSON=1  SKIP_D1=1  SKIP_VECTORIZE=1  D1_LOCAL=1
+ *
+ * By default all three targets are active (JSON/ESM + D1 + Vectorize).
+ * Use --skip-* to disable individual targets for incremental migrations.
+ * Use --d1-local to execute against a local D1 SQLite file instead of remote.
+ */
+const _args = process.argv.slice(2);
+const SKIP_JSON      = _args.includes('--skip-json')      || process.env.SKIP_JSON      === '1';
+const SKIP_D1        = _args.includes('--skip-d1')        || process.env.SKIP_D1        === '1';
+const SKIP_VECTORIZE = _args.includes('--skip-vectorize') || process.env.SKIP_VECTORIZE === '1';
+const D1_LOCAL       = _args.includes('--d1-local')       || process.env.D1_LOCAL       === '1';
+
+/** D1 database name — must match wrangler.toml [[d1_databases]] database_name */
+const D1_DATABASE = 'chatjpt-db';
+/** Vectorize index name — must match wrangler.toml [[vectorize]] index_name */
+const VECTORIZE_INDEX = 'chatjpt-vectors';
 
 // ── Cloudflare API credentials ───────────────
 const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID;
@@ -108,6 +134,9 @@ const CF_API_TOKEN = process.env.CF_API_TOKEN;
 const EMBEDDING_MODEL = config.embeddingModel;
 /** Maximum characters of document text sent to the embedding model */
 const MAX_EMBED_CHARS = config.maxEmbedChars;
+const CHAT_MODEL = config.chatModel;
+/** Maximum characters of article text sent to the enrichment model (balances context quality vs token cost) */
+const MAX_ENRICH_CHARS = 4000;
 
 /**
  * Pre-compiled regex patterns for URL exclusion.
@@ -116,6 +145,13 @@ const MAX_EMBED_CHARS = config.maxEmbedChars;
 const EXCLUDE_PATTERNS = (config.crawl.excludePatterns || []).map(
   (p) => new RegExp(p, 'i')
 );
+
+let ENRICHMENT_PROMPT;
+try {
+  ENRICHMENT_PROMPT = await fs.readFile(path.join(rootDir, 'src', 'enrichment-prompt.md'), 'utf8');
+} catch {
+  console.warn('Warning: src/enrichment-prompt.md not found. Enrichment will be skipped.');
+}
 
 // ============================================================
 // Sitemap Fetching
@@ -549,6 +585,310 @@ async function saveCache(cache) {
 }
 
 // ──────────────────────────────────────────────
+// Enrichment Cache Management
+// ──────────────────────────────────────────────
+
+async function loadEnrichmentCache() {
+  try {
+    return JSON.parse(await fs.readFile(enrichmentCachePath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+async function saveEnrichmentCache(cache) {
+  await fs.writeFile(enrichmentCachePath, JSON.stringify(cache), 'utf8');
+}
+
+// ──────────────────────────────────────────────
+// Article Enrichment via Workers AI
+// ──────────────────────────────────────────────
+
+async function fetchEnrichment(text) {
+  const truncated = text.slice(0, MAX_ENRICH_CHARS);
+
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CHAT_MODEL}`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${CF_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        messages: [
+          { role: 'system', content: ENRICHMENT_PROMPT },
+          { role: 'user', content: truncated },
+        ],
+        max_tokens: 1024,
+        temperature: 0.1,
+      }),
+    }
+  );
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    console.error(`  Enrichment HTTP ${res.status}: ${text.slice(0, 200)}`);
+    return null;
+  }
+
+  const data = await res.json();
+  if (!data.success || !data.result?.response) {
+    console.error(`  Enrichment API error: ${JSON.stringify(data.errors || []).slice(0, 200)}`);
+    return null;
+  }
+
+  const response = data.result.response;
+  if (typeof response === 'object') return response;
+
+  try {
+    return JSON.parse(response.trim());
+  } catch {
+    const match = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (match) {
+      try { return JSON.parse(match[1].trim()); } catch { /* fall through */ }
+    }
+    console.error(`  Enrichment: invalid JSON response`);
+    return null;
+  }
+}
+
+async function fetchEnrichmentWithRetry(text) {
+  const result = await fetchEnrichment(text);
+  if (result !== null) return result;
+  await new Promise(r => setTimeout(r, 3000));
+  return fetchEnrichment(text);
+}
+
+const EMPTY_METADATA = {
+  city: null,
+  neighborhoods: [],
+  places: [],
+  dishes: [],
+  categories: [],
+  cuisine_type: [],
+  occasion: [],
+};
+
+async function enrichRecords(records) {
+  if (!ENRICHMENT_PROMPT) {
+    console.log('  Skipping enrichment (enrichment prompt not loaded)');
+    return records.map(() => ({ ...EMPTY_METADATA }));
+  }
+
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+    console.log('  Skipping enrichment (credentials not set)');
+    return records.map(() => ({ ...EMPTY_METADATA }));
+  }
+
+  const cache = await loadEnrichmentCache();
+  const toEnrich = [];
+  const metadata = new Array(records.length);
+
+  for (let i = 0; i < records.length; i++) {
+    const hash = contentHash(records[i].text);
+    if (cache[records[i].id]?.hash === hash) {
+      metadata[i] = cache[records[i].id].metadata;
+    } else {
+      toEnrich.push({ index: i, hash, id: records[i].id });
+    }
+  }
+
+  const cached = records.length - toEnrich.length;
+  if (cached > 0) console.log(`  Enrichment cache: ${cached} cached, ${toEnrich.length} to enrich`);
+
+  let failed = 0;
+
+  for (let i = 0; i < toEnrich.length; i++) {
+    const item = toEnrich[i];
+    const record = records[item.index];
+
+    const result = await fetchEnrichmentWithRetry(record.text);
+    if (result) {
+      metadata[item.index] = result;
+      cache[item.id] = { hash: item.hash, metadata: result };
+    } else {
+      failed++;
+      metadata[item.index] = { ...EMPTY_METADATA };
+      cache[item.id] = { hash: item.hash, metadata: { ...EMPTY_METADATA } };
+    }
+
+    if ((i + 1) % 50 === 0 || i === toEnrich.length - 1) {
+      console.log(`  Enrichment: ${i + 1}/${toEnrich.length} (${failed} failed)`);
+    }
+
+    if ((i + 1) % 50 === 0) await saveEnrichmentCache(cache);
+
+    if (i < toEnrich.length - 1) {
+      await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+
+  await saveEnrichmentCache(cache);
+
+  if (failed > 0) console.log(`  Enrichment complete: ${failed} articles failed (stored with empty metadata)`);
+
+  return metadata;
+}
+
+// ============================================================
+// Normalization Map
+// ============================================================
+
+async function loadNormalizationMap() {
+  try {
+    return JSON.parse(await fs.readFile(normalizationMapPath, 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+function collectUniqueValues(metadataList, fields) {
+  const values = new Set();
+  for (const meta of metadataList) {
+    for (const field of fields) {
+      const arr = meta[field];
+      if (Array.isArray(arr)) {
+        arr.forEach(v => { if (typeof v === 'string' && v.trim()) values.add(v.trim().toLowerCase()); });
+      }
+    }
+  }
+  return values;
+}
+
+async function buildNormalizationMap(metadataList) {
+  const fieldsToNormalize = ['categories', 'cuisine_type', 'occasion', 'dishes'];
+  const allValues = collectUniqueValues(metadataList, fieldsToNormalize);
+  const existingMap = await loadNormalizationMap();
+  const knownValues = new Set(Object.keys(existingMap).concat(Object.values(existingMap)));
+
+  const newValues = [...allValues].filter(v => !knownValues.has(v));
+
+  if (newValues.length === 0) {
+    console.log('  Normalization: no new values found, reusing existing map');
+    return existingMap;
+  }
+
+  console.log(`  Normalization: ${newValues.length} new values found, running LLM clustering...`);
+
+  // Send the full value set (not just new values) so the LLM can cluster consistently
+  // across all terms. Sending only new values would miss cross-cluster relationships.
+  const allValuesList = [...allValues].sort();
+
+  const prompt = `Je krijgt een lijst met termen die zijn geëxtraheerd uit artikelen. Groepeer synoniemen en varianten onder één gestandaardiseerde term (bij voorkeur Nederlands).
+
+Regels:
+- Antwoord met ALLEEN valid JSON. Geen uitleg, geen markdown fencing.
+- Het JSON object mapt elke variant naar de gestandaardiseerde term: {"variant": "standaard", ...}
+- Termen die al gestandaardiseerd zijn hoeven niet in het resultaat.
+- Gebruik Nederlandse termen als standaard waar mogelijk (bijv. "dinner" → "diner", "Italian" → "Italiaans").
+- Houd termen die duidelijk verschillend zijn apart (bijv. "koffie" en "cocktails" zijn geen synoniemen).
+
+Termen om te clusteren:
+${allValuesList.join(', ')}`;
+
+  try {
+    const res = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CHAT_MODEL}`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${CF_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          messages: [
+            { role: 'system', content: 'Je bent een taalkundige assistent die synoniemen clustert.' },
+            { role: 'user', content: prompt },
+          ],
+          max_tokens: 4096,
+          temperature: 0.1,
+        }),
+      }
+    );
+
+    if (!res.ok) {
+      console.warn(`  Normalization: HTTP ${res.status}`);
+      return existingMap;
+    }
+
+    const data = await res.json();
+    if (!data.success || !data.result?.response) {
+      console.warn('  Normalization: LLM call failed, keeping existing map');
+      return existingMap;
+    }
+
+    const response = data.result.response;
+    let newMap;
+    if (typeof response === 'object') {
+      newMap = response;
+    } else {
+      try {
+        newMap = JSON.parse(response.trim());
+      } catch {
+        const match = response.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (match) {
+          try { newMap = JSON.parse(match[1].trim()); } catch { /* fall through */ }
+        }
+      }
+    }
+
+    if (!newMap || typeof newMap !== 'object') {
+      console.warn('  Normalization: could not parse LLM response, keeping existing map');
+      return existingMap;
+    }
+
+    const merged = { ...existingMap, ...newMap };
+    await fs.writeFile(normalizationMapPath, JSON.stringify(merged, null, 2), 'utf8');
+    console.log(`  Normalization: ${Object.keys(newMap).length} mappings from LLM, ${Object.keys(merged).length} total`);
+    return merged;
+
+  } catch (err) {
+    console.warn(`  Normalization: error — ${err.message}. Keeping existing map`);
+    return existingMap;
+  }
+}
+
+function applyNormalization(metadata, normMap) {
+  const normalize = (arr) => {
+    if (!Array.isArray(arr)) return arr;
+    return arr.map(v => {
+      const key = typeof v === 'string' ? v.trim().toLowerCase() : v;
+      return normMap[key] || v;
+    });
+  };
+
+  return {
+    ...metadata,
+    categories_normalized: normalize(metadata.categories),
+    cuisine_type_normalized: normalize(metadata.cuisine_type),
+    occasion_normalized: normalize(metadata.occasion),
+    dishes_normalized: normalize(metadata.dishes),
+  };
+}
+
+function buildKeywords(metadata) {
+  const keywords = new Set();
+
+  if (Array.isArray(metadata.places)) {
+    metadata.places.forEach(p => {
+      if (p?.name) keywords.add(p.name);
+    });
+  }
+
+  const dishes = metadata.dishes_normalized || metadata.dishes || [];
+  dishes.forEach(d => { if (d) keywords.add(d); });
+
+  const cats = metadata.categories_normalized || metadata.categories || [];
+  cats.forEach(c => { if (c) keywords.add(c); });
+
+  const cuisines = metadata.cuisine_type_normalized || metadata.cuisine_type || [];
+  cuisines.forEach(c => { if (c) keywords.add(c); });
+
+  return [...keywords];
+}
+
+// ──────────────────────────────────────────────
 // Cloudflare Workers AI Embedding API
 // ──────────────────────────────────────────────
 
@@ -645,6 +985,243 @@ async function generateEmbeddings(records) {
 }
 
 // ============================================================
+// D1 Seeding
+// ============================================================
+
+/**
+ * Escapes a JavaScript value into a safe SQL literal.
+ * null/undefined → NULL, numbers → bare number, strings → single-quoted
+ * with internal single quotes doubled (standard SQL escaping).
+ *
+ * @param {*} val - The value to escape.
+ * @returns {string} SQL literal fragment.
+ */
+function sqlEscape(val) {
+  if (val === null || val === undefined) return 'NULL';
+  if (typeof val === 'number') return String(val);
+  return "'" + String(val).replace(/'/g, "''") + "'";
+}
+
+/**
+ * Builds INSERT OR REPLACE SQL for one article record plus its places.
+ *
+ * Arrays (keywords, neighborhoods, categories, cuisine_type, occasion, dishes)
+ * are stored as JSON strings so they can be queried with json_each() in SQLite.
+ * schema_object is serialized as a JSON string for the same reason.
+ *
+ * @param {Object} record - Fully-assembled index record (with .metadata attached).
+ * @returns {string} One or more SQL statements ending with newlines.
+ */
+function recordToSQL(record) {
+  const meta = record.metadata || {};
+  const places = Array.isArray(meta.places) ? meta.places : [];
+
+  const cats      = meta.categories_normalized  || meta.categories   || [];
+  const cuisines  = meta.cuisine_type_normalized || meta.cuisine_type || [];
+  const occasions = meta.occasion_normalized     || meta.occasion     || [];
+  const dishes    = meta.dishes_normalized       || meta.dishes       || [];
+
+  const articleSQL = `INSERT OR REPLACE INTO articles ` +
+    `(id, url, site, name, type, description, date_published, keywords, ` +
+    `search_weight, text, schema_object, city, neighborhoods, categories, ` +
+    `cuisine_type, occasion, dishes, content_hash) VALUES (` +
+    [
+      sqlEscape(record.id),
+      sqlEscape(record.url),
+      sqlEscape(record.site),
+      sqlEscape(record.name),
+      sqlEscape(record.type),
+      sqlEscape(record.description),
+      sqlEscape(record.datePublished),
+      sqlEscape(JSON.stringify(record.keywords || [])),
+      record.searchWeight ?? 1.0,
+      sqlEscape(record.text),
+      sqlEscape(JSON.stringify(record.schema_object || null)),
+      sqlEscape(meta.city || null),
+      sqlEscape(JSON.stringify(Array.isArray(meta.neighborhoods) ? meta.neighborhoods : [])),
+      sqlEscape(JSON.stringify(cats)),
+      sqlEscape(JSON.stringify(cuisines)),
+      sqlEscape(JSON.stringify(occasions)),
+      sqlEscape(JSON.stringify(dishes)),
+      sqlEscape(contentHash(record.text)),
+    ].join(', ') + `);`;
+
+  const placesLines = places
+    .filter((p) => p?.name)
+    .map((p) =>
+      `INSERT OR REPLACE INTO article_places (article_id, name, neighborhood) VALUES (` +
+      `${sqlEscape(record.id)}, ${sqlEscape(p.name)}, ${sqlEscape(p.neighborhood || null)});`
+    );
+
+  return [articleSQL, ...placesLines].join('\n');
+}
+
+/**
+ * Seeds the D1 database with all article records.
+ *
+ * Strategy: generate SQL INSERT OR REPLACE statements in batches of 50 records,
+ * write each batch to a temp SQL file, then execute via `wrangler d1 execute`.
+ * Temp files are deleted after each successful or failed batch.
+ *
+ * Uses --remote by default (production D1). Pass --d1-local / D1_LOCAL=1 for
+ * local SQLite development.
+ *
+ * @param {Object[]} records - Fully-assembled index records with .metadata.
+ */
+async function seedD1(records) {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const wranglerBin = path.join(rootDir, 'node_modules', '.bin', 'wrangler');
+  const remoteFlag = D1_LOCAL ? '--local' : '--remote';
+  const BATCH_SIZE = 50;
+  let seeded = 0;
+  let failed = 0;
+
+  console.log(`\nSeeding D1 (${D1_DATABASE}) with ${records.length} articles [${remoteFlag}]...`);
+
+  for (let i = 0; i < records.length; i += BATCH_SIZE) {
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(records.length / BATCH_SIZE);
+    const chunk = records.slice(i, i + BATCH_SIZE);
+    const sql = chunk.map(recordToSQL).join('\n') + '\n';
+    const tmpFile = path.join(outputDir, `_d1-seed-${batchNum}.sql`);
+
+    await fs.writeFile(tmpFile, sql, 'utf8');
+
+    try {
+      await execFileAsync(wranglerBin, [
+        'd1', 'execute', D1_DATABASE,
+        '--file', tmpFile,
+        remoteFlag,
+        '--yes',   // skip interactive confirmation prompts
+      ]);
+      seeded += chunk.length;
+      console.log(`  D1 batch ${batchNum}/${totalBatches}: ${chunk.length} articles OK (${seeded} total)`);
+    } catch (err) {
+      failed += chunk.length;
+      // Extract the meaningful part of wrangler's stderr for the log
+      const detail = (err.stderr || err.message || '').split('\n').find((l) => l.trim()) || '';
+      console.error(`  D1 batch ${batchNum}/${totalBatches} FAILED: ${detail}`);
+    } finally {
+      await fs.unlink(tmpFile).catch(() => {});
+    }
+  }
+
+  console.log(`  D1 seeding complete: ${seeded} seeded, ${failed} failed`);
+}
+
+// ============================================================
+// Vectorize Upsert
+// ============================================================
+
+/**
+ * Upserts embeddings + metadata to the Cloudflare Vectorize index.
+ *
+ * Uses the Vectorize v2 REST API which accepts NDJSON (application/x-ndjson).
+ * Each line is a JSON object: { id, values, metadata }.
+ *
+ * Metadata stored per vector (for filtering at query time):
+ *   site, type, name, city, categories, cuisine_type, occasion
+ * Arrays are stored as JSON strings because Vectorize metadata values must be
+ * scalars (string | number | boolean) — not nested arrays/objects.
+ *
+ * Batches of up to 500 vectors per request (Vectorize v2 limit is 1000;
+ * 500 is a safe default given large 768-dim float arrays).
+ *
+ * @param {Object[]} records - Fully-assembled index records with .metadata.
+ * @param {(number[]|null)[]} embeddings - Parallel array of 768-dim embeddings.
+ */
+async function upsertVectorize(records, embeddings) {
+  const BATCH_SIZE = 500;
+
+  // Pair records with their embeddings; skip any with null embeddings
+  const pairs = records
+    .map((r, i) => ({ record: r, embedding: embeddings[i] }))
+    .filter((p) => Array.isArray(p.embedding));
+
+  if (pairs.length === 0) {
+    console.log('\nVectorize: no embeddings to upsert (all null — skipping)');
+    return;
+  }
+
+  console.log(`\nUpserting ${pairs.length} vectors to Vectorize (${VECTORIZE_INDEX})...`);
+  let upserted = 0;
+
+  for (let i = 0; i < pairs.length; i += BATCH_SIZE) {
+    const batchNum = Math.floor(i / BATCH_SIZE) + 1;
+    const totalBatches = Math.ceil(pairs.length / BATCH_SIZE);
+    const batch = pairs.slice(i, i + BATCH_SIZE);
+
+    const ndjson = batch.map(({ record, embedding }) => {
+      const meta = record.metadata || {};
+      const cats      = meta.categories_normalized  || meta.categories   || [];
+      const cuisines  = meta.cuisine_type_normalized || meta.cuisine_type || [];
+      const occasions = meta.occasion_normalized     || meta.occasion     || [];
+      // Vectorize caps IDs at 64 bytes. SHA-256 hex is exactly 64 chars.
+      // Store the original article ID in metadata so we can look it up in D1.
+      const vectorId = createHash('sha256').update(record.id).digest('hex');
+      return JSON.stringify({
+        id: vectorId,
+        values: embedding,
+        metadata: {
+          article_id:   record.id,
+          site:         record.site,
+          type:         record.type,
+          name:         record.name,
+          city:         meta.city || '',
+          categories:   cats,
+          cuisine_type: cuisines,
+          occasion:     occasions,
+        },
+      });
+    }).join('\n');
+
+    let retries = 2;
+    while (retries >= 0) {
+      const res = await fetch(
+        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/vectorize/v2/indexes/${VECTORIZE_INDEX}/upsert`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${CF_API_TOKEN}`,
+            'Content-Type': 'application/x-ndjson',
+          },
+          body: ndjson,
+        }
+      );
+
+      if (!res.ok) {
+        const body = await res.text().catch(() => '');
+        if (retries > 0) {
+          console.warn(`  Vectorize batch ${batchNum}/${totalBatches} HTTP ${res.status} — retrying...`);
+          await new Promise((r) => setTimeout(r, 3000));
+          retries--;
+          continue;
+        }
+        console.error(`  Vectorize batch ${batchNum}/${totalBatches} FAILED HTTP ${res.status}: ${body.slice(0, 200)}`);
+        break;
+      }
+
+      const data = await res.json();
+      if (!data.success) {
+        console.error(`  Vectorize batch ${batchNum}/${totalBatches} API error: ${JSON.stringify(data.errors || []).slice(0, 200)}`);
+        break;
+      }
+
+      upserted += batch.length;
+      console.log(`  Vectorize batch ${batchNum}/${totalBatches}: ${batch.length} vectors OK (${upserted} total)`);
+      break;
+    }
+
+    if (i + BATCH_SIZE < pairs.length) await new Promise((r) => setTimeout(r, 500));
+  }
+
+  console.log(`  Vectorize upsert complete: ${upserted}/${pairs.length} vectors`);
+}
+
+// ============================================================
 // Main — Orchestrates the full index generation pipeline
 // ============================================================
 
@@ -652,26 +1229,40 @@ async function generateEmbeddings(records) {
  * Main entry point for the index generation pipeline.
  *
  * Steps:
- * 1. Validate credentials (CF_ACCOUNT_ID + CF_API_TOKEN required)
- * 2. Ensure output directory exists
- * 3. Fetch sitemap URLs and filter by exclude patterns
- * 4. Fetch markdown for each page (with caching + rate limiting)
- * 5. Build index records (clean text, extract titles, assign types)
- * 6. Filter out "thin" pages (< 50 chars of clean text)
- * 7. Generate embeddings (with caching + batching)
- * 8. Write output files (JSON + ESM)
+ * 1.  Validate credentials (CF_ACCOUNT_ID + CF_API_TOKEN required)
+ * 2.  Ensure output directory exists
+ * 3.  Fetch sitemap URLs and filter by exclude patterns
+ * 4.  Fetch markdown for each page (with caching + rate limiting)
+ * 5.  Build index records (clean text, extract titles, assign types)
+ * 6.  Enrich records with structured metadata via Workers AI (cached)
+ * 7.  Build normalization map (cluster synonyms via LLM)
+ * 8.  Attach metadata to records and populate keywords
+ * 9.  Generate vector embeddings (with caching + batching)
+ * 10. [unless --skip-json]      Write JSON + ESM index files
+ * 11. [unless --skip-d1]        Seed D1 database via wrangler
+ * 12. [unless --skip-vectorize] Upsert vectors to Vectorize
+ *
+ * All three output targets are active by default (backward-compatible).
+ * Disable individual targets with --skip-json / --skip-d1 / --skip-vectorize
+ * or the corresponding SKIP_JSON / SKIP_D1 / SKIP_VECTORIZE env vars.
  *
  * The entire process is idempotent: running it multiple times with warm
  * caches produces the same output, and only processes changed content.
  */
 async function main() {
-  // Validate required credentials
   if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
     console.error('Set CF_ACCOUNT_ID and CF_API_TOKEN environment variables.');
     process.exit(1);
   }
 
-  // Ensure output directory exists (creates recursively if needed)
+  // Log active output targets so the operator knows what will be written
+  const targets = [
+    !SKIP_JSON      && 'json+esm',
+    !SKIP_D1        && `d1(${D1_LOCAL ? 'local' : 'remote'})`,
+    !SKIP_VECTORIZE && 'vectorize',
+  ].filter(Boolean);
+  console.log(`Output targets: ${targets.join(', ') || '(none — all skipped)'}`);
+
   await fs.mkdir(outputDir, { recursive: true });
 
   // Step 1: Discover all indexable URLs from the sitemap
@@ -686,26 +1277,56 @@ async function main() {
   const records = pages
     .filter((p) => p.markdown && cleanMarkdown(p.markdown).length > 50)
     .map(buildRecord);
-  // Sort by publication date (newest first) for consistent ordering
   records.sort((a, b) => (b.datePublished || '').localeCompare(a.datePublished || ''));
   console.log(`Built ${records.length} index records (filtered out ${pages.length - records.length} thin pages)`);
 
-  // Step 4: Generate vector embeddings (cached — only new/changed content)
+  // Step 4: Enrich records with structured metadata (cached — only new/changed content)
+  console.log(`\nEnriching ${records.length} records with metadata...`);
+  const metadataList = await enrichRecords(records);
+
+  // Step 5: Build normalization map from enrichment output
+  console.log(`\nBuilding normalization map...`);
+  const normMap = await buildNormalizationMap(metadataList);
+
+  // Step 6: Attach metadata to records and populate keywords
+  for (let i = 0; i < records.length; i++) {
+    const normalizedMeta = applyNormalization(metadataList[i], normMap);
+    records[i].metadata = normalizedMeta;
+    records[i].keywords = buildKeywords(normalizedMeta);
+  }
+
+  // Step 7: Generate vector embeddings (cached — only new/changed content)
   console.log(`\nGenerating embeddings for ${records.length} records...`);
   const embeddings = await generateEmbeddings(records);
-  // Attach embeddings to their corresponding records
   for (let i = 0; i < records.length; i++) {
     records[i].embedding = embeddings[i];
   }
 
-  // Step 5: Write the index files
+  // Step 8: Write JSON + ESM index files (backward-compatible output)
   const json = JSON.stringify(records, null, 2) + '\n';
-  await fs.writeFile(outputJsonPath, json, 'utf8');         // Raw JSON (for debugging)
-  await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');  // ESM module
+  if (!SKIP_JSON) {
+    await fs.writeFile(outputJsonPath, json, 'utf8');
+    await fs.writeFile(outputModulePath, `export default ${json};`, 'utf8');
+    const sizeKB = Math.round(Buffer.byteLength(json) / 1024);
+    console.log(`\nWrote JSON + ESM index: ${records.length} records (${sizeKB}KB)`);
+  }
+
+  // Step 9: Seed D1 database
+  if (!SKIP_D1) {
+    await seedD1(records);
+  }
+
+  // Step 10: Upsert embeddings to Vectorize
+  if (!SKIP_VECTORIZE) {
+    await upsertVectorize(records, embeddings);
+  }
 
   // Summary
-  const sizeKB = Math.round(Buffer.byteLength(json) / 1024);
-  console.log(`\nGenerated ChatJPT index: ${records.length} records (${sizeKB}KB)`);
+  const enriched = metadataList.filter(m => m.city !== null).length;
+  console.log(`\nChatJPT index complete: ${records.length} records`);
+  console.log(`  Enriched: ${enriched}/${records.length} articles with metadata`);
+  console.log(`  Normalization map: ${Object.keys(normMap).length} mappings`);
+  console.log(`  Targets written: ${targets.join(', ') || '(none)'}`);
 }
 
 // Run the pipeline and exit on error
