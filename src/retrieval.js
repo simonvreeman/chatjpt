@@ -22,7 +22,7 @@
  * - Vague follow-up detection and query augmentation for multi-turn conversations
  */
 
-import { AI_TIMEOUT_MS, EMBEDDING_MODEL, withTimeout } from './config.js';
+import { AI_TIMEOUT_MS, EMBEDDING_MODEL, INTENT_MODEL, withTimeout } from './config.js';
 import siteConfig from '../chatjpt.config.mjs';
 
 // ──────────────────────────────────────────────
@@ -247,6 +247,73 @@ export async function embedQuery(ai, query) {
     return res?.data?.[0] || null;
   } catch {
     return null;
+  }
+}
+
+// ──────────────────────────────────────────────
+// Intent Parsing (Structured Filter Extraction)
+// ──────────────────────────────────────────────
+
+/**
+ * Extracts structured search filters from the user query using a fast LLM.
+ *
+ * Returns an object with any combination of these fields:
+ *   { city, neighborhood, categories, cuisine_type, occasion }
+ * All fields are optional — missing means "no filter for this dimension".
+ *
+ * Runs in parallel with embedQuery (they are independent).
+ * Returns {} on any failure so search always proceeds.
+ *
+ * @param {Object} ai - Cloudflare Workers AI binding (env.AI).
+ * @param {string} query - The user's search query.
+ * @returns {Promise<Object>} Extracted filter hints (partial, may be empty).
+ */
+export async function parseQueryIntent(ai, query) {
+  if (!ai) return {};
+  try {
+    const res = await withTimeout(
+      ai.run(INTENT_MODEL, {
+        messages: [
+          {
+            role: 'system',
+            content: `Extract search filters from the user query as JSON.
+Return ONLY a JSON object with these optional fields:
+- city: string (e.g. "Amsterdam", "Rotterdam") or null
+- neighborhood: string (e.g. "De Pijp", "Jordaan") or null
+- categories: string[] (e.g. ["restaurants", "bars"]) or null
+- cuisine_type: string[] (e.g. ["italiaans", "japans"]) or null
+- occasion: string[] (e.g. ["lunch", "diner", "date"]) or null
+
+Only include fields you are confident about. Return {} if nothing is clear.
+Respond with ONLY the JSON object, no explanation.`,
+          },
+          { role: 'user', content: query },
+        ],
+        max_tokens: 200,
+        temperature: 0,
+      }),
+      AI_TIMEOUT_MS,
+    );
+
+    const raw = res?.response;
+    if (!raw || typeof raw !== 'string') return {};
+
+    // Parse JSON — strip markdown fences if present
+    const jsonStr = raw.trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, '').trim();
+    const parsed = JSON.parse(jsonStr);
+    if (typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+
+    // Sanitize: only keep known keys, strip nulls
+    const result = {};
+    if (parsed.city && typeof parsed.city === 'string') result.city = parsed.city;
+    if (parsed.neighborhood && typeof parsed.neighborhood === 'string') result.neighborhood = parsed.neighborhood;
+    if (Array.isArray(parsed.categories) && parsed.categories.length) result.categories = parsed.categories;
+    if (Array.isArray(parsed.cuisine_type) && parsed.cuisine_type.length) result.cuisine_type = parsed.cuisine_type;
+    if (Array.isArray(parsed.occasion) && parsed.occasion.length) result.occasion = parsed.occasion;
+
+    return result;
+  } catch {
+    return {};
   }
 }
 
