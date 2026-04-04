@@ -305,7 +305,7 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
 
   for (let i = 0; i < uniqueStages.length; i++) {
     const filter = buildVectorizeFilter(uniqueStages[i]);
-    const queryOptions = { topK, returnMetadata: 'none' };
+    const queryOptions = { topK, returnMetadata: 'indexed' };
     if (filter) queryOptions.filter = filter;
 
     try {
@@ -316,7 +316,7 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
     }
 
     if (lastMatches.length >= 5) {
-      return { ids: lastMatches.map((m) => m.id), relaxedFilters };
+      return { ids: lastMatches.map((m) => m.metadata?.article_id || m.id), relaxedFilters };
     }
 
     // Record what we're about to drop for the next stage
@@ -328,7 +328,7 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
   }
 
   // All stages exhausted — return whatever the last stage gave us
-  return { ids: lastMatches.map((m) => m.id), relaxedFilters };
+  return { ids: lastMatches.map((m) => m.metadata?.article_id || m.id), relaxedFilters };
 }
 
 // ──────────────────────────────────────────────

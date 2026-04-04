@@ -1159,10 +1159,14 @@ async function upsertVectorize(records, embeddings) {
       const cats      = meta.categories_normalized  || meta.categories   || [];
       const cuisines  = meta.cuisine_type_normalized || meta.cuisine_type || [];
       const occasions = meta.occasion_normalized     || meta.occasion     || [];
+      // Vectorize caps IDs at 64 bytes. SHA-256 hex is exactly 64 chars.
+      // Store the original article ID in metadata so we can look it up in D1.
+      const vectorId = createHash('sha256').update(record.id).digest('hex');
       return JSON.stringify({
-        id: record.id,
+        id: vectorId,
         values: embedding,
         metadata: {
+          article_id:   record.id,
           site:         record.site,
           type:         record.type,
           name:         record.name,
