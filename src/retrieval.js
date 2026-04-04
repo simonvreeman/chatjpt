@@ -364,6 +364,95 @@ export async function queryVectorize(env, embedding, filterHints, topK = 50) {
 }
 
 // ──────────────────────────────────────────────
+// D1 Article Fetching
+// ──────────────────────────────────────────────
+
+/**
+ * Fetches full article records from D1 by their IDs.
+ *
+ * Fetches both the main article fields and their associated places
+ * (from article_places table), then shapes the result to match the
+ * document interface expected by scoreDocument() and buildContext().
+ *
+ * Array columns stored as JSON strings in D1 (keywords, categories, etc.)
+ * are parsed back to arrays.
+ *
+ * @param {Object} env - Worker environment bindings (needs env.DB).
+ * @param {string[]} ids - Article IDs returned by queryVectorize.
+ * @returns {Promise<Object[]>} Array of document-shaped records.
+ */
+export async function fetchArticlesFromD1(env, ids) {
+  if (!env?.DB || !ids?.length) return [];
+
+  try {
+    // D1 prepared statement placeholders: ?,?,?,...
+    const placeholders = ids.map(() => '?').join(', ');
+
+    // Fetch main article records
+    const articlesResult = await env.DB
+      .prepare(`SELECT * FROM articles WHERE id IN (${placeholders})`)
+      .bind(...ids)
+      .all();
+    const rows = articlesResult?.results || [];
+
+    if (!rows.length) return [];
+
+    // Fetch associated places for these articles
+    const placesResult = await env.DB
+      .prepare(`SELECT article_id, name, neighborhood FROM article_places WHERE article_id IN (${placeholders})`)
+      .bind(...ids)
+      .all();
+    const placesRows = placesResult?.results || [];
+
+    // Group places by article_id
+    const placesByArticle = {};
+    for (const p of placesRows) {
+      if (!placesByArticle[p.article_id]) placesByArticle[p.article_id] = [];
+      placesByArticle[p.article_id].push({ name: p.name, neighborhood: p.neighborhood });
+    }
+
+    // Shape rows to match the document interface
+    return rows.map((row) => {
+      const safeParseArray = (val) => {
+        if (Array.isArray(val)) return val;
+        if (typeof val === 'string' && val.startsWith('[')) {
+          try { return JSON.parse(val); } catch { return []; }
+        }
+        return [];
+      };
+
+      return {
+        id:            row.id,
+        url:           row.url,
+        site:          row.site,
+        name:          row.name,
+        type:          row.type,
+        description:   row.description || '',
+        datePublished: row.date_published || null,
+        keywords:      safeParseArray(row.keywords),
+        searchWeight:  row.search_weight ?? 1.0,
+        text:          row.text || '',
+        schema_object: (() => {
+          try { return typeof row.schema_object === 'string' ? JSON.parse(row.schema_object) : (row.schema_object || null); }
+          catch { return null; }
+        })(),
+        // Enrichment metadata (available for generation context)
+        city:          row.city || null,
+        neighborhoods: safeParseArray(row.neighborhoods),
+        categories:    safeParseArray(row.categories),
+        cuisine_type:  safeParseArray(row.cuisine_type),
+        occasion:      safeParseArray(row.occasion),
+        dishes:        safeParseArray(row.dishes),
+        places:        placesByArticle[row.id] || [],
+      };
+    });
+  } catch (err) {
+    console.error('fetchArticlesFromD1 failed:', err.message);
+    return [];
+  }
+}
+
+// ──────────────────────────────────────────────
 // Intent Parsing (Structured Filter Extraction)
 // ──────────────────────────────────────────────
 
